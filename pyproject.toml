@@ -1,0 +1,25 @@
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "F",      # Pyflakes
+  "W",      # pycodestyle warnings
+  "E",      # pycodestyle errors
+  "ASYNC",  # flake8-async
+  "C4",     # flake8-comprehensions
+  "Q",      # flake8-quotes
+  "I",      # import-order
+  "UP",     # pyupgrade
+]
+ignore = [
+  "E501",     # 与 AstrBot 上游一致：不卡行宽（中文注释行很容易超）
+  "F403",
+  "F405",
+  "ASYNC230",
+  "ASYNC240",
+]
+
+[tool.ruff.format]
+quote-style = "double"

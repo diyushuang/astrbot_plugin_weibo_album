@@ -1,0 +1,66 @@
+{
+  "napcat_http_root": {
+    "description": "NapCat HTTP API 地址",
+    "type": "string",
+    "default": "",
+    "hint": "留空则复用 AstrBot 与 NapCat 已有的 OneBot 连接；跨机部署时填 http://127.0.0.1:3000",
+    "obvious_hint": true
+  },
+  "napcat_token": {
+    "description": "NapCat HTTP 访问令牌",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "仅在使用 HTTP 直连时需要（NapCat 网络服务里设置的 token）"
+  },
+  "weibo_cookie": {
+    "description": "微博 Cookie",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "一般留空即可，插件会自动走访客通道；只有个别受限微博才需要填登录 Cookie",
+    "obvious_hint": true
+  },
+  "default_album": {
+    "description": "默认目标相册名",
+    "type": "string",
+    "default": "微博原图",
+    "hint": "可用 /群相册列表 查看现有相册名；NapCat 没有建相册接口，相册需先在群里手动创建。本群用 /绑定相册 绑定的相册优先于这一项",
+    "obvious_hint": true
+  },
+  "max_images": {
+    "description": "单次最多上传图片数",
+    "type": "int",
+    "default": 30,
+    "hint": "微博单条最多 18 张；抓取博主相册/超话时可调大"
+  },
+  "max_pages": {
+    "description": "抓取博主相册/时间线时的翻页数",
+    "type": "int",
+    "default": 3,
+    "hint": "容器接口风控比单条微博严，调大容易撞限流"
+  },
+  "upload_interval": {
+    "description": "两张图之间的间隔秒数",
+    "type": "float",
+    "default": 1.5,
+    "hint": "防 QQ 侧频控，上传失败多可调大到 3"
+  },
+  "skip_exists": {
+    "description": "跳过相册里已有的图片",
+    "type": "bool",
+    "default": true,
+    "hint": "按微博图片 pid 与相册内文件名比对，重复执行同一条微博不会传重"
+  },
+  "request_timeout": {
+    "description": "微博请求超时（秒）",
+    "type": "int",
+    "default": 25
+  },
+  "proxy": {
+    "description": "代理地址",
+    "type": "string",
+    "default": "",
+    "hint": "形如 http://127.0.0.1:7890，留空表示不用"
+  }
+}
