@@ -1,20 +1,20 @@
 """NapCat 群相册客户端：封装 NapCat 的 OneBot 扩展相册接口。
 
+传输只有一条路：复用 AstrBot 与 NapCat 已有的那条 OneBot 连接，由调用方注入 caller。
+地址、token 这些都是 AstrBot 适配器该管的事，插件不另配一份。
+
 接口契约以 NapCatQQ 源码为准（packages/napcat-onebot/action/router.ts、extends/*）：
-- POST /get_qun_album_list          {group_id:str, attach_info?:str} -> {album_list, attach_info, has_more}
-- POST /upload_image_to_qun_album   {group_id:str, album_id:str, album_name:str, file:str} -> 无 data
-- POST /get_group_album_media_list  {group_id:str, album_id:str, attach_info:str} -> {media_list, has_more}
+- get_qun_album_list          {group_id:str, attach_info?:str} -> {album_list, attach_info, has_more}
+- upload_image_to_qun_album   {group_id:str, album_id:str, album_name:str, file:str} -> 无 data
+- get_group_album_media_list  {group_id:str, album_id:str, attach_info:str} -> {media_list, has_more}
 
 接口名里 qun/group 混用是上游现状，不是笔误；四个参数全是 String，传数字会被 schema 拒掉。
 """
 
 import asyncio
 import base64
-import json
 import re
 from pathlib import Path
-
-import aiohttp
 
 ALBUM_LIST_ITEM_ID_KEYS = ("album_id", "albumId", "albumIdB64", "id", "bmpno")
 ALBUM_LIST_ITEM_NAME_KEYS = ("album_name", "albumName", "name", "title")
@@ -22,8 +22,7 @@ ALBUM_LIST_ITEM_NAME_KEYS = ("album_name", "albumName", "name", "title")
 # NapCat 对这个接口没有声明返回类型（ReturnSchema = Type.Any），只能多键兜。
 MEDIA_NAME_KEYS = ("name", "fname", "caption", "fileName", "file_name", "description")
 
-# "协议端没有这个接口"的真实文案：HTTP 是 `不支持的Api <action>`(retcode 200)，
-# WebSocket 是 `不支持的API <action>`(retcode 1404)。
+# "协议端没有这个接口"的真实文案：NapCat 对未实现的 action 抛 `不支持的API <action>`(retcode 1404)。
 _ACTION_MISSING_HINTS = (
     "不支持的api",
     "unknown api",
@@ -36,9 +35,9 @@ _ACTION_MISSING_HINTS = (
     "不存在该接口",
     "无此接口",
 )
-# 只有"载荷取不到"才值得换下一种传输方式。
+# 只有"载荷取不到"才值得换下一种载荷方式。
 # 注意不能写裸的 "no such"：NapCat 读不到本地文件时抛的正是
-# `ENOENT: no such file or directory`，那是跨机部署的正常信号，不是接口缺失。
+# `ENOENT: no such file or directory`，那是 NapCat 与 AstrBot 不同机的正常信号，不是接口缺失。
 _FILE_UNUSABLE_HINTS = (
     "no such file",
     "enoent",
@@ -49,7 +48,7 @@ _FILE_UNUSABLE_HINTS = (
     "无法读取",
     "没有那个文件或目录",
 )
-# NapCat 的相册接口只会给出 400/200(HTTP) 或 1400/1200/1404(WebSocket)，
+# 走 AstrBot 的 OneBot 连接时 NapCat 只会给出 1400/1200/1404 这类码，
 # 语义靠 message 判断比靠 retcode 可靠。
 _HINT_RULES = (
     (
@@ -125,90 +124,36 @@ def _fail(action: str, detail: str, code: int = 0) -> NapCatError:
 
 
 class NapCatAlbum:
-    """两种传输方式二选一：api_root 直连 NapCat HTTP，caller 复用 AstrBot 已有的 OneBot 连接。"""
+    """走调用方注入的 caller —— 也就是 AstrBot 已经和 NapCat 建好的那条 OneBot 连接。"""
 
-    def __init__(
-        self,
-        session: aiohttp.ClientSession,
-        api_root: str = "",
-        token: str = "",
-        timeout: int = 60,
-        retries: int = 2,
-        caller=None,
-    ):
-        self.s = session
-        self.root = (api_root or "").rstrip("/")
-        self.token = (token or "").strip()
-        self.timeout = timeout
-        self.retries = retries
+    def __init__(self, caller, retries: int = 2):
+        if caller is None:
+            raise NapCatError("拿不到 AstrBot 与 NapCat 之间的连接")
         self.caller = caller
-        if not self.root and self.caller is None:
-            raise NapCatError(
-                "需要 NapCat HTTP API 地址，或复用 AstrBot 的 OneBot 连接"
-            )
+        self.retries = retries
 
     async def call(self, action: str, **params) -> dict:
-        url = f"{self.root}/{action}"
-        headers = {"Content-Type": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
         body = {k: v for k, v in params.items() if v is not None}
         last = ""
         for attempt in range(self.retries + 1):
-            j = None
-            if self.caller is not None:
-                try:
-                    res = await self.caller(action, dict(body))
-                except Exception as e:  # aiocqhttp ActionFailed / 连接异常
-                    # ActionFailed 把 retcode/message 藏在 .info 里，str() 只剩个壳
-                    info = getattr(e, "info", None)
-                    info = info if isinstance(info, dict) else {}
-                    code = info.get("retcode", 0) or 0
-                    last = (
-                        str(info.get("message") or info.get("wording") or "").strip()
-                        or str(e)
-                        or repr(e)
-                    )
-                    if _retryable(last) and attempt < self.retries:
-                        await asyncio.sleep(2.0**attempt)
-                        continue
-                    raise _fail(action, last, code) from e
-                wrapped = isinstance(res, dict) and "retcode" in res
-                j = res if wrapped else {"retcode": 0, "data": res or {}}
-            else:
-                try:
-                    async with self.s.post(
-                        url,
-                        json=body,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    ) as r:
-                        text = await r.text()
-                        # NapCat 自身不限制 JSON body 大小，但前面的反代/nginx 会
-                        if r.status == 413:
-                            raise _fail(
-                                action,
-                                "请求体被拒（http 413）：NapCat 与 AstrBot 不同机时请留空 "
-                                "napcat_http_root 改走 AstrBot 已有连接，或调大反代的 body 上限",
-                            )
-                        if r.status >= 500:
-                            last = f"http {r.status}"
-                            await asyncio.sleep(0.8 * (attempt + 1))
-                            continue
-                        try:
-                            j = json.loads(text)
-                        except Exception:
-                            raise _fail(
-                                action, f"返回非 JSON (http {r.status}): {text[:160]}"
-                            ) from None
-                except NapCatError:
-                    raise
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    last = repr(e)
-                    await asyncio.sleep(0.8 * (attempt + 1))
+            try:
+                res = await self.caller(action, dict(body))
+            except Exception as e:  # aiocqhttp ActionFailed / 连接异常
+                # ActionFailed 把 retcode/message 藏在 .info 里，str() 只剩个壳
+                info = getattr(e, "info", None)
+                info = info if isinstance(info, dict) else {}
+                code = info.get("retcode", 0) or 0
+                last = (
+                    str(info.get("message") or info.get("wording") or "").strip()
+                    or str(e)
+                    or repr(e)
+                )
+                if _retryable(last) and attempt < self.retries:
+                    await asyncio.sleep(2.0**attempt)
                     continue
-            if j is None:
-                continue
+                raise _fail(action, last, code) from e
+            wrapped = isinstance(res, dict) and "retcode" in res
+            j = res if wrapped else {"retcode": 0, "data": res or {}}
             code = j.get("retcode", 0)
             if code != 0 or j.get("status") == "failed":
                 msg = j.get("message") or j.get("wording") or ""

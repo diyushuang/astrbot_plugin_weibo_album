@@ -1,18 +1,4 @@
 {
-  "napcat_http_root": {
-    "description": "NapCat HTTP API 地址",
-    "type": "string",
-    "default": "",
-    "hint": "留空则复用 AstrBot 与 NapCat 已有的 OneBot 连接；跨机部署时填 http://127.0.0.1:3000",
-    "obvious_hint": true
-  },
-  "napcat_token": {
-    "description": "NapCat HTTP 访问令牌",
-    "type": "string",
-    "default": "",
-    "secret": true,
-    "hint": "仅在使用 HTTP 直连时需要（NapCat 网络服务里设置的 token）"
-  },
   "weibo_cookie": {
     "description": "微博 Cookie",
     "type": "string",

@@ -38,13 +38,15 @@
 
 ## 安装
 
-1. 准备 NapCat：群相册接口（`get_qun_album_list` / `upload_image_to_qun_album`）是 2025-08-25
-   之后进入主干的，最低 **v4.8.101**，带完整 OpenAPI 声明的最早是 4.12.0；同时确认群设置里允许
-   成员（机器人）上传相册，并先在群里手动建好目标相册（NapCat 没有创建相册的接口）。
+1. 准备 NapCat：就是 AstrBot 已经接好的那个 aiocqhttp(OneBot) 适配器，**插件不需要另配地址或 token**。
+   群相册接口（`get_qun_album_list` / `upload_image_to_qun_album`）是 2025-08-25 之后进入主干的，
+   最低 **v4.8.101**，带完整 OpenAPI 声明的最早是 4.12.0；同时确认群设置里允许成员（机器人）上传
+   相册，并先在群里手动建好目标相册（NapCat 没有创建相册的接口）。
 2. 把本目录复制到 AstrBot 的插件目录，**目录名要和 `metadata.yaml` 里的 `name` 一致**：
    ```bash
    cp -r . <AstrBot 根目录>/data/plugins/astrbot_plugin_weibo_album
    ```
+   发布用的 zip 顶层就是这个目录名，WebUI 里直接上传 zip 也一样。
 3. AstrBot WebUI → 插件管理 → 重载插件（首次会自动装 `requirements.txt`）。
 4. `/群相册列表` 确认相册名，然后 `/绑定相册 <相册名>`。
 
@@ -52,8 +54,6 @@
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `napcat_http_root` | 空 | **留空即复用 AstrBot 与 NapCat 已有的 OneBot 连接**，零配置可用；跨机部署时填 `http://127.0.0.1:3000` |
-| `napcat_token` | 空 | 走 HTTP 直连时填 NapCat 网络服务里的 token |
 | `weibo_cookie` | 空 | 一般不用填，插件会自动走微博访客通道；个别受限微博再填登录 Cookie |
 | `default_album` | `微博原图` | 未绑定且命令里没写相册名时的目标相册 |
 | `max_images` | `30` | 单次最多上传张数（微博单条上限 18，抓时间线时可调大） |
@@ -79,14 +79,16 @@
 
 ## 上传侧的做法
 
-- 传输方式两种，默认复用 AstrBot 已有的 OneBot 连接（`bot.api.call_action`），也可填 NapCat HTTP 地址直连。
+- 传输只有一条路：复用 AstrBot 与 NapCat 之间已经建好的那条 OneBot 连接（`event.bot.api.call_action`，
+  并按 `self_id` 路由到对应的那个适配器）。地址、token 都是 AstrBot 适配器的事，插件不另配一份；
+  消息不是来自 aiocqhttp 平台时直接告知"这条消息所在的平台调不到群相册接口"。
 - 上传载荷按 **本地路径 → `file://` → `base64://`** 依次尝试：相册里显示的文件名来自上传文件本身
   （NapCat 对 base64 载荷用 `randomUUID` 命名，对本地路径取 `basename`），所以先把图片落成一个
-  可读的文件名（`<相册名>_<pid前缀>.jpg`）再传。NapCat 与机器人不同机时路径会抛
+  可读的文件名（`<相册名>_<pid前缀>.jpg`）再传。NapCat 与 AstrBot 不同机时路径会抛
   `ENOENT: no such file or directory`，插件把这识别成"换下一种载荷"而不是"接口不存在"，自动降级 base64。
 - 只有**载荷类**错误才会换格式重试；权限、相册不存在这类业务错误第一次就抛出，不会白试三遍。
-- NapCat 的相册接口并不产出 1400/1401/1404 这类语义错误码（HTTP 通道只给 400/200，WebSocket
-  通道给 1400/1200/1404），所以可操作提示是按 message 文本判断的，不承诺具体 retcode。
+- NapCat 的相册接口并不产出 1401 这类语义错误码（走 OneBot 连接只会见到 1400/1200/1404），
+  所以可操作提示是按 message 文本判断的，不承诺具体 retcode。
 - NapCat 上传成功不返回图片 id，所以插件在上传前后各读一次相册媒体列表：上传前用它做去重跳过，
   上传后用差集回报「相册新增 N 张」，读不到只降级为提示、不影响上传本身。媒体列表的 `has_more`
   在上游类型声明里并不存在，缺字段时改按 `attach_info` 是否还在往前走来判断，不会只翻一页就停。
@@ -110,22 +112,20 @@ python tests/test_plugin_e2e.py      # 端到端：真实微博抓取 + mock Nap
 
 覆盖：18 图全量上传、相册文件名可读、新增数校验、重复执行去重且提示真的发出去、
 `skip_exists` 关闭后照常重传、小程序文本、裸 ID、绑定/显式相册优先级、解绑与权限登记、
-`max_images` 截断、复用 OneBot 连接、真实 ENOENT 降级 base64、私聊/相册不存在/空参数提示、
-同群并发被锁挡住、预览、临时文件清理。
+`max_images` 截断、调用带 `self_id` 路由、非 NapCat 平台时明确拒绝、真实 ENOENT 降级 base64、
+私聊/相册不存在/空参数提示、同群并发被锁挡住、预览、临时文件清理。
 
 同一次运行内会缓存微博抓取结果（首个仍是真实网络），否则 9 个上传环节会打出 160+ 次请求。
 
 ## 已知边界
 
 - 已用真实链接验证：单条微博（含 18 图）、`weibo.com/<uid>/<bid>`、小程序分享文本、博主时间线，
-  以及两条上传通道。
+  上传通道则是经 AstrBot 已有的那条 OneBot 连接（对端用假 NapCat 演到真实错误码与文案级别）。
 - 按官方文档实现但还没拿到真实样本验证：头条文章、转发微博、博主相册容器 `107803`
   （该容器卡片结构与时间线不同，目前抓不到图，需要真实链接来校准）。
 - NapCat 没有创建相册的接口，目标相册必须先存在（解析失败时会带上现有相册清单）。
 - 只对接 NapCat 的接口名（`get_qun_album_list` / `upload_image_to_qun_album`）。LLOneBot 等协议端
   用的是另一套名字（`get_group_album_list` / `upload_group_album` + `files=[]`），本插件未适配。
-- 填了 `napcat_http_root` 走 HTTP 直连时，NapCat 自身不限 JSON body 大小，但反代（nginx 等）可能
-  返回 413；跨机部署建议留空该配置，改走 AstrBot 已有连接。
 - 只搬图片，不带微博正文；视频、直播、纯文字微博会被跳过。
 - 容器类抓取依赖 `container/getIndex`，风控比单条微博严，失败时填 `weibo_cookie`。
 - 单张原图超过 30MB 会被跳过。

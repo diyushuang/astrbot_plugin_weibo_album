@@ -137,15 +137,10 @@ class WeiboAlbumPlugin(Star):
         return self._wb
 
     async def _album_client(self, event: AstrMessageEvent) -> NapCatAlbum:
-        s = await self._get_session()
-        root = (self.config.get("napcat_http_root") or "").strip()
-        if root:
-            return NapCatAlbum(
-                s, api_root=root, token=self.config.get("napcat_token", "")
-            )
         if not isinstance(event, AiocqhttpMessageEvent):
             raise NapCatError(
-                "当前平台拿不到 NapCat 连接，请在插件配置里填 NapCat HTTP API 地址"
+                "本插件直接用 AstrBot 自己的 NapCat 连接，"
+                "而这条消息不是来自 aiocqhttp(NapCat) 平台，调不到群相册接口"
             )
         bot = event.bot
         self_id = event.message_obj.self_id
@@ -155,7 +150,7 @@ class WeiboAlbumPlugin(Star):
                 params["self_id"] = self_id
             return await bot.api.call_action(action, **params)
 
-        return NapCatAlbum(s, caller=caller)
+        return NapCatAlbum(caller)
 
     async def _resolve_album(
         self, nc: NapCatAlbum, gid: str, want: str

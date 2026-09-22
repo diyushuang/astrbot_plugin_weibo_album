@@ -1,4 +1,4 @@
-"""端到端验证：按 AstrBot 的加载方式导入插件，跑真实微博抓取 + mock NapCat 相册上传。
+"""端到端验证：按 AstrBot 的加载方式导入插件，跑真实微博抓取 + 假 NapCat 相册上传。
 
 python tests/test_plugin_e2e.py
 
@@ -29,6 +29,11 @@ WEIBO_MINI_TEXT = (
     "【微博】一起来看 https://m.weibo.cn/status/Ab1Cd2Ef3 打开微博小程序查看"
 )
 N_PICS = 18
+
+# install_fake_astrbot() 造的那个假 AiocqhttpMessageEvent，以及挂在 AstrBot 那条
+# OneBot 连接对面的假 NapCat；main() 开头填好，make_event 默认按"来自 aiocqhttp 平台"造事件。
+EVENT_BASE: type = object
+EVENT_BOT = None
 
 
 class GreedyStr(str):
@@ -71,6 +76,8 @@ class MessageEventResult(MessageChain):
 
 def install_fake_astrbot():
     """造出插件用到的 astrbot API 面，签名与真实实现一致。"""
+
+    global EVENT_BASE
 
     def mod(name):
         m = types.ModuleType(name)
@@ -155,6 +162,7 @@ def install_fake_astrbot():
         pass
 
     emod.AiocqhttpMessageEvent = AiocqhttpMessageEvent
+    EVENT_BASE = AiocqhttpMessageEvent
 
     # astrbot.core.star.filter.command —— 只提供 GreedyStr，真实 CommandFilter 由
     # 下面的 FakeCommandRouter 按上游算法复刻，用来做真正的参数绑定。
@@ -238,7 +246,11 @@ class FakeCommandRouter:
         raise AssertionError(f"没有指令匹配到 {message_str!r}")
 
 
-def make_event(text, group_id="123456", bot=None, base=object, admin=True):
+def make_event(text, group_id="123456", admin=True, napcat=True):
+    """napcat=False 造一条"来自别的平台"的消息：既不是 AiocqhttpMessageEvent 也没有 bot。"""
+    base = EVENT_BASE if napcat else object
+    bot = EVENT_BOT if napcat else None
+
     class E(base):
         def __init__(self):
             self.message_str = text
@@ -292,8 +304,6 @@ def import_plugin():
 
 
 CONFIG = {
-    "napcat_http_root": "http://127.0.0.1:19001",
-    "napcat_token": "tk",
     "weibo_cookie": "",
     "default_album": "微博原图",
     "max_images": 30,
@@ -330,58 +340,56 @@ def cache_network(module):
     module.WeiboClient.download = download
 
 
-def reset_store(store):
-    store["uploads"] = []
-    store["media"] = []
-    store["calls"] = []
+def file_parts(value):
+    """把 NapCat 收到的 file 字段还原成本地路径；base64 时返回 None。"""
+    if value.startswith("base64://"):
+        return None
+    if value.startswith("file://"):
+        value = value[len("file://") :]
+    return Path(value)
 
 
-async def main():
-    from aiohttp import web
+class ActionFailed(Exception):
+    """port of aiocqhttp.ActionFailed：retcode/message 藏在 .info 里，str() 只剩个壳。"""
 
-    flt, Star, AiocqHttpEvent, registered = install_fake_astrbot()
-    store = {"uploads": [], "media": [], "calls": [], "reject_path": 0}
+    def __init__(self, retcode, message):
+        super().__init__("Action execution failed.")
+        self.info = {"retcode": retcode, "message": message}
 
-    def file_parts(value):
-        """把 NapCat 收到的 file 字段还原成本地路径；base64 时返回 None。"""
-        if value.startswith("base64://"):
-            return None
-        if value.startswith("file://"):
-            value = value[len("file://") :]
-        return Path(value)
 
-    async def router(req):
-        action = req.match_info["action"]
-        b = await req.json()
-        store["calls"].append((action, b))
+class FakeNapCat:
+    """挂在 AstrBot 那条 OneBot 连接对面的 NapCat。
+
+    插件只剩这一条通道，所以这里按 aiocqhttp 的契约演：call_action(action, **params)
+    成功就直接返回 data，失败抛 ActionFailed。错误码照抄真实行为：未实现的接口是 1404
+    『不支持的API <action>』，跨机读不到文件是 1400『ENOENT: no such file or directory』。
+    """
+
+    def __init__(self, store):
+        self.store = store
+
+    async def call_action(self, action, **params):
+        store = self.store
+        store["calls"].append((action, params))
         if action == "get_qun_album_list":
-            return web.json_response(
-                {
-                    "status": "ok",
-                    "retcode": 0,
-                    "data": {
-                        "album_list": [
-                            {"album_id": "0_aaaaaaaa", "name": "微博原图"},
-                            {"album_id": "0_bbbbbbbb", "name": "其他相册"},
-                        ],
-                        "has_more": False,
-                    },
-                }
-            )
+            return {
+                "album_list": [
+                    {"album_id": "0_aaaaaaaa", "name": "微博原图"},
+                    {"album_id": "0_bbbbbbbb", "name": "其他相册"},
+                ],
+                "has_more": False,
+            }
         if action == "get_group_album_media_list":
-            return web.json_response(
-                {
-                    "status": "ok",
-                    "retcode": 0,
-                    "data": {
-                        "media_list": [{"name": n} for n in store["media"]],
-                        "has_more": False,
-                    },
-                }
-            )
+            return {
+                "media_list": [{"name": n} for n in store["media"]],
+                "has_more": False,
+            }
         if action == "upload_image_to_qun_album":
-            val = b["file"]
+            val = params["file"]
             p = file_parts(val)
+            if p is not None and store["reject_path"] > 0:
+                store["reject_path"] -= 1
+                raise ActionFailed(1400, "ENOENT: no such file or directory, open ''")
             if p is None:
                 size, mode, name = len(base64.b64decode(val[9:])), "base64", ""
             else:
@@ -390,34 +398,24 @@ async def main():
                     ("file_uri" if val.startswith("file://") else "path"),
                 )
                 name = p.name
-            if p is not None and store["reject_path"] > 0:
-                store["reject_path"] -= 1
-                return web.json_response(
-                    {
-                        "status": "failed",
-                        "retcode": 400,
-                        "data": None,
-                        "message": "ENOENT: no such file or directory, open ''",
-                        "wording": "",
-                    }
-                )
-            store["uploads"].append({**b, "_size": size, "_mode": mode})
+            store["uploads"].append({**params, "_size": size, "_mode": mode})
             store["media"].append(name)
-            return web.json_response({"status": "ok", "retcode": 0, "data": None})
-        return web.json_response(
-            {
-                "status": "failed",
-                "retcode": 200,
-                "message": f"不支持的Api {action}",
-                "wording": "",
-            }
-        )
+            return None  # uploadImageToQunAlbum 没有 return，data 是 null
+        raise ActionFailed(1404, f"不支持的API {action}")
 
-    app = web.Application(client_max_size=64 * 1024 * 1024)
-    app.router.add_post("/{action}", router)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "127.0.0.1", 19001).start()
+
+def reset_store(store):
+    store["uploads"] = []
+    store["media"] = []
+    store["calls"] = []
+
+
+async def main():
+    global EVENT_BOT
+
+    flt, Star, _, registered = install_fake_astrbot()
+    store = {"uploads": [], "media": [], "calls": [], "reject_path": 0}
+    EVENT_BOT = types.SimpleNamespace(api=FakeNapCat(store))
 
     module, tmp = import_plugin()
     cache_network(module)
@@ -468,6 +466,9 @@ async def main():
             "uploads"
         ][0]
         assert all(isinstance(u["group_id"], str) for u in store["uploads"])
+        assert all(
+            p.get("self_id") == 10001 for _, p in store["calls"]
+        ), "走 AstrBot 连接时必须带 self_id 路由到对应的那个 NapCat"
         names_up = [Path(u["file"]).name for u in store["uploads"]]
         assert all(n.endswith((".jpg", ".png", ".gif")) for n in names_up), names_up[:3]
         assert f"相册新增 {N_PICS} 张" in ev.sent[-1], ev.sent[-1]
@@ -551,38 +552,16 @@ async def main():
         plugin.config["max_images"] = 30
         print("[ok] 用例8 max_images 截断并告知用户")
 
-        # ---- 用例 9：复用 AstrBot 的 NapCat 连接
+        # ---- 用例 9：不是 aiocqhttp 平台时给明确提示（已经没有"另配 HTTP 地址"这条路）
         reset_store(store)
-        seen = []
-
-        class FakeApi:
-            async def call_action(self, action, **params):
-                seen.append((action, params))
-                if action == "get_qun_album_list":
-                    return {
-                        "album_list": [{"album_id": "0_cccccccc", "name": "微博原图"}],
-                        "has_more": False,
-                    }
-                if action == "get_group_album_media_list":
-                    return {"media_list": [], "has_more": False}
-                if action == "upload_image_to_qun_album":
-                    store["uploads"].append(params)
-                    return None
-                raise RuntimeError("unsupported")
-
-        plugin.config["napcat_http_root"] = ""
-        ev9 = make_event(
-            WEIBO_LINK, bot=types.SimpleNamespace(api=FakeApi()), base=AiocqHttpEvent
-        )
+        ev9 = make_event(WEIBO_LINK, napcat=False)
         await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev9)
-        assert len(store["uploads"]) == N_PICS, (len(store["uploads"]), ev9.sent[-1:])
-        assert all(p.get("self_id") == 10001 for _, p in seen), seen[0]
-        assert all(
-            file_parts(u["file"]) and file_parts(u["file"]).is_absolute()
-            for u in store["uploads"]
-        ), store["uploads"][0]["file"][:60]
-        print("[ok] 用例9 复用 AstrBot 的 NapCat 连接上传成功，且带上 self_id 路由")
-        plugin.config["napcat_http_root"] = CONFIG["napcat_http_root"]
+        assert any("aiocqhttp" in s for s in ev9.sent), ev9.sent
+        assert not store["uploads"] and not store["calls"], "拿不到连接时不该发出任何调用"
+        assert not any("填" in s or "HTTP API" in s for s in ev9.sent), (
+            "不该再把用户推去自己填 NapCat 地址:" + " / ".join(ev9.sent)
+        )
+        print("[ok] 用例9 非 NapCat 平台给出明确提示:", ev9.sent[-1][:44])
 
         # ---- 用例 10：跨机部署时真实 ENOENT 下降级 base64
         reset_store(store)
@@ -636,7 +615,6 @@ async def main():
     finally:
         if plugin is not None:
             await plugin.terminate()
-        await runner.cleanup()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
