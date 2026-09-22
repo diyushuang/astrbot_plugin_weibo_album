@@ -309,6 +309,7 @@ CONFIG = {
     "max_images": 30,
     "max_pages": 2,
     "upload_interval": 0,
+    "keep_days": 7,
     "request_timeout": 25,
     "proxy": "",
     "skip_exists": True,
@@ -450,10 +451,10 @@ async def main():
             "[ok] 契约1 split_album 认得 '<链接> <相册名>' 与 | 分隔，且不误读分享文本"
         )
 
-        # ---- 用例 1：真实指令文本 -> 走完参数绑定 -> 18 图全部上传
+        # ---- 用例 1：真实指令文本 -> 走完参数绑定 -> 先整批落本地，再 18 张全部上传
         reset_store(store)
         ev = make_event(WEIBO_LINK)
-        await rt.dispatch(f"微博相册 {WEIBO_LINK}", ev)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev)
         assert ev.stopped, "接管消息后应当 stop_event，避免其它解析插件重复响应"
         assert len(store["uploads"]) == N_PICS, (
             f"应上传 {N_PICS} 张，实际 {len(store['uploads'])}"
@@ -471,41 +472,86 @@ async def main():
         ), "走 AstrBot 连接时必须带 self_id 路由到对应的那个 NapCat"
         names_up = [Path(u["file"]).name for u in store["uploads"]]
         assert all(n.endswith((".jpg", ".png", ".gif")) for n in names_up), names_up[:3]
-        assert f"相册新增 {N_PICS} 张" in ev.sent[-1], ev.sent[-1]
+        assert "已保留" in ev.sent[-1], ev.sent[-1]
         print(
             f"[ok] 用例1 真实微博 {N_PICS} 张原图经完整指令链路上传成功，"
             f"最小 {min(sizes) // 1024}KB，相册名回查正确"
         )
 
+        # ---- 用例 1b：本地图是有意保留的，可以人工筛选后用 /传相册 再传
+        folders = sorted(plugin.root.glob("*"), key=lambda p: p.name)
+        assert folders, "下载目录不该被删掉"
+        kept = list(folders[-1].glob("*.jpg"))
+        marks = [re.sub(r"\.\w+$", "", p.name) for p in kept]
+        assert len(kept) == N_PICS and len(set(marks)) == N_PICS, (
+            len(kept),
+            len(set(marks)),
+        )
+        assert len({p.stat().st_size for p in kept}) > 1, (
+            "本地文件名撞车了，整批写进了同一个文件"
+        )
+        assert len(store["uploads"]) == len(
+            {Path(u["file"]).name for u in store["uploads"]}
+        )
+        assert kept[0].stat().st_size > 100_000
+        print(
+            "[ok] 用例1b 这批图留在",
+            folders[-1].name + "/",
+            f"共 {len(kept)} 张，传完没被删",
+        )
+
         # ---- 用例 2：再传一次全部去重跳过，且这条提示真的能发到群里
+        before = len(store["uploads"])
         ev2 = make_event(WEIBO_LINK)
-        await rt.dispatch(f"微博相册 {WEIBO_LINK}", ev2)
-        assert len(store["uploads"]) == N_PICS, "重复上传没有被去重拦掉"
-        assert any("都已经有了" in s for s in ev2.sent), ev2.sent
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev2)
+        assert len(store["uploads"]) == before, (
+            f"去重没生效，又多传了 {len(store['uploads']) - before} 张"
+        )
+        assert any("已经有" in s and "无需重复上传" in s for s in ev2.sent), ev2.sent
         print(
             "[ok] 用例2 重复执行按 pid 去重，并且提示确实发出去了（stop_event 后不再丢消息）"
         )
 
         # ---- 用例 3：关掉去重就真的重传
         plugin.config["skip_exists"] = False
+        before3 = len(store["uploads"])
         ev3 = make_event(WEIBO_LINK)
-        await rt.dispatch(f"微博相册 {WEIBO_LINK}", ev3)
-        assert len(store["uploads"]) == N_PICS * 2
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev3)
+        assert len(store["uploads"]) == before3 + N_PICS, (
+            len(store["uploads"]) - before3
+        )
         plugin.config["skip_exists"] = True
         print("[ok] 用例3 skip_exists=False 时照常重传")
 
-        # ---- 用例 4：小程序分享文本（尾部中文不会被当成相册名）
+        # ---- 用例 4：不写相册名就先列相册让用户选，/传相册 <编号> 才真的传
         reset_store(store)
         ev4 = make_event(WEIBO_MINI_TEXT)
         await rt.dispatch(f"微博相册 {WEIBO_MINI_TEXT}", ev4)
-        assert len(store["uploads"]) == N_PICS, len(store["uploads"])
+        assert not store["uploads"], "没指定相册时不该猜一个就传"
+        assert any("微博原图" in s and "其他相册" in s for s in ev4.sent), ev4.sent
+        assert any("/传相册" in s for s in ev4.sent), ev4.sent
+        print("[ok] 用例4a 小程序分享文本抓到图后列出相册待选，不会误读分享文案")
+
+        ev4b = make_event("1")
+        await rt.dispatch("传相册 1", ev4b)
+        assert len(store["uploads"]) == N_PICS, (len(store["uploads"]), ev4b.sent[-1:])
+        assert all(u["album_id"] == "0_aaaaaaaa" for u in store["uploads"])
         assert all(u["album_name"] == "微博原图" for u in store["uploads"])
-        print("[ok] 用例4 小程序分享文本抓到全部原图，相册名走默认值")
+        assert {c[0] for c in store["calls"]} >= {
+            "get_qun_album_list",
+            "upload_image_to_qun_album",
+        }
+        print("[ok] 用例4b /传相册 1 按编号选中第一个相册并整批上传")
+
+        ev4c = make_event("1")
+        await rt.dispatch("传相册 1", ev4c)
+        assert any("没有待上传" in s for s in ev4c.sent), ev4c.sent
+        print("[ok] 用例4c 传完之后待上传批次就清掉了，不会重复传")
 
         # ---- 用例 5：只发裸 ID 也能认；没链接也没 ID 时给出可操作提示
         reset_store(store)
         ev5 = make_event("Ab1Cd2Ef3")
-        await rt.dispatch("微博相册 Ab1Cd2Ef3", ev5)
+        await rt.dispatch("微博相册 Ab1Cd2Ef3 | 微博原图", ev5)
         assert len(store["uploads"]) == N_PICS, (len(store["uploads"]), ev5.sent)
         print("[ok] 用例5a 裸微博 ID 直接可用")
 
@@ -517,7 +563,7 @@ async def main():
             ev5b.sent[-1][:34],
         )
 
-        # ---- 用例 6：绑定相册 / 显式相册名优先
+        # ---- 用例 6：绑定的相册只是 /传相册 不带参数时的默认，编号和名字都能盖掉它
         reset_store(store)
         assert await plugin.get_kv_data("album:123456", "") in (None, ""), (
             "初始不该有绑定"
@@ -526,13 +572,21 @@ async def main():
         await rt.dispatch("绑定相册 其他相册", ev6)
         assert await plugin.get_kv_data("album:123456", "") == "其他相册", ev6.sent
         await rt.dispatch(f"微博相册 {WEIBO_LINK}", make_event(WEIBO_LINK))
+        ev6b = make_event("")
+        await rt.dispatch("传相册", ev6b)
         assert all(u["album_id"] == "0_bbbbbbbb" for u in store["uploads"]), store[
             "uploads"
-        ][0]
+        ][:1]
+        print("[ok] 用例6a /传相册 不带参数时走本群绑定的默认相册")
+
+        reset_store(store)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK}", make_event(WEIBO_LINK))
+        await rt.dispatch("传相册 微博原图", make_event("微博原图"))
+        assert all(u["album_id"] == "0_aaaaaaaa" for u in store["uploads"])
         reset_store(store)
         await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", make_event(WEIBO_LINK))
         assert all(u["album_id"] == "0_aaaaaaaa" for u in store["uploads"])
-        print("[ok] 用例6 绑定相册生效，显式相册名优先于绑定")
+        print("[ok] 用例6b 编号/相册名/指令里直接带名字都能盖掉绑定的默认相册")
 
         # ---- 用例 7：解绑 + 权限过滤确实挂在绑定/解绑上
         await rt.dispatch("解绑相册", make_event(""))
@@ -546,9 +600,9 @@ async def main():
         reset_store(store)
         plugin.config["max_images"] = 5
         ev8 = make_event(WEIBO_LINK)
-        await rt.dispatch(f"微博相册 {WEIBO_LINK}", ev8)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev8)
         assert len(store["uploads"]) == 5, len(store["uploads"])
-        assert "截断" in ev8.sent[0]
+        assert "截断" in ev8.sent[0], ev8.sent[0]
         plugin.config["max_images"] = 30
         print("[ok] 用例8 max_images 截断并告知用户")
 
@@ -589,26 +643,40 @@ async def main():
 
         # ---- 用例 12：并发锁，同群第二个请求不会挤进去
         reset_store(store)
+        plugin.config["upload_interval"] = 0.2  # 让第一批真的还在传，第二发才撞得上锁
         a = asyncio.create_task(
-            rt.dispatch(f"微博相册 {WEIBO_LINK}", make_event(WEIBO_LINK))
+            rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", make_event(WEIBO_LINK))
         )
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.6)
         ev14 = make_event(WEIBO_LINK)
-        await rt.dispatch(f"微博相册 {WEIBO_LINK}", ev14)
-        assert any("正在上传" in s for s in ev14.sent), ev14.sent
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev14)
+        assert any("正在处理" in s for s in ev14.sent), ev14.sent
+        assert 0 < len(store["uploads"]) < N_PICS, (
+            f"第二发挤进去了：已传 {len(store['uploads'])} 张"
+        )
         await a
+        plugin.config["upload_interval"] = 0
+        assert len(store["uploads"]) == N_PICS, len(store["uploads"])
         print("[ok] 用例12 同群并发请求被锁挡住，不会重复上传")
 
-        # ---- 用例 13：预览 / 相册列表 / 临时文件清理
+        # ---- 用例 13：预览 / 相册列表 / 本地批次目录都保留
         ev15 = make_event(WEIBO_LINK)
         await rt.dispatch(f"微博图片 {WEIBO_LINK}", ev15)
         assert any(f"{N_PICS} 张" in s for s in ev15.sent), ev15.sent
         ev16 = make_event("")
         await rt.dispatch("群相册列表", ev16)
         assert any("微博原图" in s and "0_aaaaaaaa" in s for s in ev16.sent), ev16.sent
-        left = list(plugin.staging.glob("*"))
-        assert not left, f"临时文件没清掉: {left[:3]}"
-        print("[ok] 用例13 预览/相册列表正常，暂存目录已清空")
+        batches = sorted(plugin.root.glob("*"), key=lambda p: p.name)
+        assert len(batches) >= 2, [b.name for b in batches]
+        for b in batches:
+            imgs = list(b.glob("*"))
+            assert len(imgs) >= 2, f"批次目录 {b.name} 里只有 {len(imgs)} 个文件"
+            assert all(f.stat().st_size > 0 for f in imgs)
+        print(
+            "[ok] 用例13 预览/相册列表正常，",
+            len(batches),
+            "个本地批次目录都留着（传完不删）",
+        )
 
         await plugin.terminate()
         print("\n全部用例通过")

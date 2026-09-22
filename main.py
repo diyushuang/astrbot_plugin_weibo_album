@@ -5,7 +5,9 @@
 """
 
 import asyncio
+import hashlib
 import re
+import shutil
 import time
 from collections import Counter
 from pathlib import Path
@@ -28,9 +30,9 @@ from .napcat_album import (
 )
 from .weibo_client import ANY_URL_RE, Image, WeiboClient, WeiboError
 
-PREFETCH = 3  # 并行预取的图片张数，上传仍按顺序进行
-PID_MARK = 10  # 用 pid 前缀做去重标记和相册文件名后缀
-STALE_SECONDS = 86400
+PREFETCH = 5  # 下载并发度：整批先落到本地，之后才传相册
+PENDING_TTL = 1800  # 下载完等 /传相册 选相册的存活时间
+MAX_ALBUM_CHOICES = 15  # 选择列表一次最多列几个相册
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\s]+')
 
 
@@ -38,9 +40,20 @@ def _safe_token(s: str) -> str:
     return _BAD_NAME.sub("", s or "")[:24] or "weibo"
 
 
+def _stem(img: Image) -> str:
+    """本地文件名主干，必须是每张图唯一的。
+
+    微博 pid 的前若干位在同一博主名下是公共前缀（实测一条微博 18 张图前 10 位完全相同），
+    所以只能整串用上；没有 pid 的正文扫图就退回 URL 摘要。
+    """
+    if img.pid:
+        return _BAD_NAME.sub("", img.pid)[:64]
+    return hashlib.sha1(img.url.encode("utf-8")).hexdigest()[:16]
+
+
 def _mark(img: Image) -> str:
-    """相册内的稳定标识：微博 pid 前缀，用来判断"这张已经传过"。"""
-    return (img.pid or img.url.split("/")[-1])[:PID_MARK].lower()
+    """相册里的稳定标识：整串 pid（或 URL 摘要），用来判断"这张已经传过"。"""
+    return _stem(img).lower()
 
 
 def split_album(text: str) -> tuple[str, str]:
@@ -64,7 +77,7 @@ def split_album(text: str) -> tuple[str, str]:
 
 
 class WeiboAlbumPlugin(Star):
-    """把微博里的原图整套搬进 QQ 群相册。"""
+    """把微博里的原图整套搬进 QQ 群相册：先整批抓到本地，再传到选定的相册。"""
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -72,14 +85,15 @@ class WeiboAlbumPlugin(Star):
         self._session: aiohttp.ClientSession | None = None
         self._wb: WeiboClient | None = None
         self._locks: dict[str, asyncio.Lock] = {}
+        self._pending: dict[str, dict] = {}  # gid -> 下载完在等 /传相册 指定相册的那批图
         data_dir = StarTools.get_data_dir(
             getattr(self, "name", None) or "astrbot_plugin_weibo_album"
         )
-        self.staging = Path(data_dir) / "staging"
+        self.root = Path(data_dir) / "albums"
 
     async def initialize(self):
-        self.staging.mkdir(parents=True, exist_ok=True)
-        self._drop_stale()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._drop_old()
         await self._get_session()
 
     async def terminate(self):
@@ -88,11 +102,16 @@ class WeiboAlbumPlugin(Star):
             await self._session.close()
         self._session = None
 
-    def _drop_stale(self):
-        for p in self.staging.glob("*"):
+    def _drop_old(self):
+        """本地批次目录是有意保留的（方便人工筛选和重传），只按天数回收旧批次。"""
+        days = self._num("keep_days", 7)
+        if days <= 0:
+            return
+        cutoff = time.time() - days * 86400
+        for d in self.root.glob("*"):
             try:
-                if p.is_file() and time.time() - p.stat().st_mtime > STALE_SECONDS:
-                    p.unlink()
+                if d.is_dir() and d.stat().st_mtime < cutoff:
+                    shutil.rmtree(d)
             except OSError:
                 pass
 
@@ -152,13 +171,18 @@ class WeiboAlbumPlugin(Star):
 
         return NapCatAlbum(caller)
 
+    async def _default_album(self, gid: str) -> str:
+        return (
+            await self.get_kv_data(f"album:{gid}", "")
+            or self.config.get("default_album", "")
+            or ""
+        )
+
     async def _resolve_album(
         self, nc: NapCatAlbum, gid: str, want: str
     ) -> tuple[str, str]:
         if not want:
-            want = await self.get_kv_data(f"album:{gid}", "") or self.config.get(
-                "default_album", ""
-            )
+            want = await self._default_album(gid)
         return await nc.resolve_album(gid, want)
 
     async def _existing_names(self, nc: NapCatAlbum, gid: str, album_id: str) -> str:
@@ -185,7 +209,7 @@ class WeiboAlbumPlugin(Star):
 
     @filter.command("微博相册", alias={"微博传图", "wbalbum"})
     async def grab_to_album(self, event: AstrMessageEvent, text: GreedyStr):
-        """抓取微博全部原图并上传到群相册：/微博相册 <链接> [| 相册名]"""
+        """抓取微博全部原图存到本地，再传进群相册：/微博相册 <链接> [| 相册名]"""
         # 先接管事件，免得链接解析类插件把同一批图再往群里刷一遍
         event.stop_event()
         gid = str(event.get_group_id() or "")
@@ -194,10 +218,50 @@ class WeiboAlbumPlugin(Star):
             return
         lock = self._locks.setdefault(gid, asyncio.Lock())
         if lock.locked():
-            await self._reply(event, "本群已有一批图正在上传，请等它结束后再试")
+            await self._reply(event, "本群已有一批图正在处理，请等它结束后再试")
             return
         async with lock:
             await self._grab(event, gid, text)
+
+    @filter.command("传相册", alias={"上传相册", "wbpush"})
+    async def push_album(self, event: AstrMessageEvent, text: GreedyStr):
+        """把刚下载到本地的那批图传进指定相册：/传相册 <编号或相册名>"""
+        event.stop_event()
+        gid = str(event.get_group_id() or "")
+        if not gid:
+            await self._reply(event, "请在群聊里使用本插件，群相册需要群号")
+            return
+        lock = self._locks.setdefault(gid, asyncio.Lock())
+        if lock.locked():
+            await self._reply(event, "本群已有一批图正在处理，请等它结束后再试")
+            return
+        async with lock:
+            await self._push(event, gid, text)
+
+    async def _push(self, event: AstrMessageEvent, gid: str, want: str) -> None:
+        job = self._pending.get(gid)
+        if not job or time.time() - job["ts"] > PENDING_TTL:
+            self._pending.pop(gid, None)
+            await self._reply(event, "没有待上传的图了，先 /微博相册 <链接> 抓一批")
+            return
+        want = (want or "").strip()
+        try:
+            nc = await self._album_client(event)
+            nums = job["albums"]
+            if want.isdigit() and 1 <= int(want) <= len(nums):
+                album = nums[int(want) - 1]
+            elif not want and not await self._default_album(gid):
+                await self._reply(
+                    event,
+                    "本群没绑定默认相册，请发 /传相册 <编号或相册名>，"
+                    "相册见上一条消息里的列表",
+                )
+                return
+            else:
+                album = await self._resolve_album(nc, gid, want)
+            await self._upload(event, nc, gid, album, job["files"])
+        except (WeiboError, NapCatError) as e:
+            await self._reply(event, f"失败：{e}")
 
     async def _grab(self, event: AstrMessageEvent, gid: str, text: str) -> None:
         link_text, want = split_album(text)
@@ -215,89 +279,152 @@ class WeiboAlbumPlugin(Star):
                 images = images[:limit]
 
             nc = await self._album_client(event)
-            album_id, album_name = await self._resolve_album(nc, gid, want)
-
-            existing = ""
-            if self.config.get("skip_exists", True):
-                existing = await self._existing_names(nc, gid, album_id)
-            todo = [im for im in images if _mark(im) and _mark(im) not in existing]
-            dup = len(images) - len(todo)
-            if not todo:
+            await self._reply(event, f"抓到 {len(images)} 张原图{note}，先整批存到本地…")
+            folder = self._job_dir(posts)
+            files, fails = await self._download_all(wb, images, folder)
+            if not files:
                 await self._reply(
                     event,
-                    f"抓到的 {len(images)} 张图相册「{album_name}」里都已经有了，无需重复上传",
+                    f"{len(images)} 张一张都没下载下来：\n" + "\n".join(fails[:5]),
                 )
                 return
-
-            head = f"抓到 {len(images)} 张原图{note}"
-            if dup:
-                head += f"，其中 {dup} 张相册里已存在，跳过"
-            head += f"，开始上传 {len(todo)} 张到相册「{album_name}」"
-            await self._reply(event, head)
-
-            before = await self._media_count(nc, gid, album_id)
-            ok, fails, modes = 0, [], Counter()
-            interval = self._num("upload_interval", 1.5, float)
-            for i in range(0, len(todo), PREFETCH):
-                batch = todo[i : i + PREFETCH]
-                blobs = await asyncio.gather(
-                    *(wb.download(im) for im in batch), return_exceptions=True
-                )
-                for im, data in zip(batch, blobs, strict=True):
-                    if isinstance(data, BaseException):
-                        fails.append(f"{_mark(im)}：{data}")
-                        continue
-                    try:
-                        modes[
-                            await self._stage_and_upload(
-                                nc, gid, album_id, album_name, im, data
-                            )
-                        ] += 1
-                        ok += 1
-                    except (NapCatError, OSError) as e:
-                        fails.append(f"{_mark(im)}：{e}")
-                        self.logger.warning(f"[weibo_album] 上传失败 {im.url}: {e}")
-                    if interval:
-                        await asyncio.sleep(interval)
-
-            after = await self._media_count(nc, gid, album_id)
-            gained = after - before if (before >= 0 and after >= 0) else -1
-            msg = f"上传完成：成功 {ok}/{len(todo)} 张 -> 相册「{album_name}」"
-            if gained >= 0:
-                msg += f"，相册新增 {gained} 张"
-            if modes:
-                msg += f"（{modes.most_common(1)[0][0]} 方式）"
+            head = f"已存 {len(files)} 张到 {folder.name}/"
             if fails:
-                msg += "\n失败明细：\n" + "\n".join(fails[:5])
-                if len(fails) > 5:
-                    msg += f"\n…另有 {len(fails) - 5} 张失败"
-            await self._reply(event, msg)
+                head += f"（{len(fails)} 张下载失败）"
+            if want:
+                try:
+                    album = await self._resolve_album(nc, gid, want)
+                except NapCatError as e:
+                    # 相册名写错了也别把已经下好的图丢掉，直接转成"现选一个"
+                    await self._ask_album(event, nc, gid, files, f"{head}\n{e}")
+                    return
+                await self._upload(event, nc, gid, album, files, head)
+            else:
+                await self._ask_album(event, nc, gid, files, head)
         except (WeiboError, NapCatError) as e:
             await self._reply(event, f"失败：{e}")
         except Exception as e:
             self.logger.exception("[weibo_album] 未预期错误")
             await self._reply(event, f"出错了：{e}")
 
-    async def _stage_and_upload(
+    def _job_dir(self, posts) -> Path:
+        src = next((p.bid or p.mid for p in posts if (p.bid or p.mid)), "weibo")
+        folder = self.root / f"{time.strftime('%Y%m%d-%H%M%S')}_{_safe_token(src)}"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    async def _download_all(
+        self, wb: WeiboClient, images: list[Image], folder: Path
+    ) -> tuple[list[tuple[Image, Path]], list[str]]:
+        """整批并发下载到本地目录。
+
+        下载可以并发，相册上传不行（QQ 侧频控 + 要按顺序回报新增数），所以两阶段拆开：
+        先并发把图全落到本地，再一张一张传，任何一环失败都不会让已经抓到的图重下一遍。
+        """
+        sem = asyncio.Semaphore(PREFETCH)
+
+        async def one(im: Image) -> tuple[Path | None, str]:
+            async with sem:
+                try:
+                    data = await wb.download(im)
+                except WeiboError as e:
+                    return None, f"{_mark(im)}：{e}"
+            path = folder / f"{_stem(im)}.{im.ext or 'jpg'}"
+            try:
+                path.write_bytes(data)
+            except OSError as e:
+                return None, f"{_mark(im)}：写本地文件失败 {e}"
+            return path, ""
+
+        results = await asyncio.gather(*(one(im) for im in images))
+        files = [(im, p) for im, (p, _) in zip(images, results, strict=True) if p]
+        fails = [msg for _, msg in results if msg]
+        return files, fails
+
+    async def _ask_album(
+        self, event: AstrMessageEvent, nc: NapCatAlbum, gid: str, files, head: str
+    ) -> None:
+        """没写相册名就不猜：把相册列出来让用户这一次挑，绑定的那个只作为默认候选。"""
+        albums = [
+            (pick(a, ALBUM_LIST_ITEM_ID_KEYS), pick(a, ALBUM_LIST_ITEM_NAME_KEYS, "?"))
+            for a in await nc.list_albums(gid)
+        ]
+        albums = [pair for pair in albums if pair[0]]
+        if not albums:
+            await self._reply(
+                event,
+                f"{head}\n这个群还没有相册（或机器人没权限），请先在 QQ 里建一个相册",
+            )
+            return
+        default = await self._default_album(gid)
+        shown = albums[:MAX_ALBUM_CHOICES]
+        lines = [f"{i + 1}. {name}" for i, (_, name) in enumerate(shown)]
+        if len(albums) > len(shown):
+            lines.append(f"…共 {len(albums)} 个，没列出的直接写相册名")
+        self._pending[gid] = {"files": files, "albums": albums, "ts": time.time()}
+        tip = f"{PENDING_TTL // 60} 分钟内有效"
+        if default:
+            tip = f"只发 /传相册 就传到「{default}」；{tip}"
+        await self._reply(
+            event,
+            f"{head}\n传到哪个相册？\n" + "\n".join(lines) + f"\n/传相册 <编号或相册名>（{tip}）",
+        )
+
+    async def _upload(
         self,
+        event: AstrMessageEvent,
         nc: NapCatAlbum,
         gid: str,
-        album_id: str,
-        album_name: str,
-        im: Image,
-        blob: bytes,
-    ) -> str:
-        """落盘成有含义的文件名再上传：相册里显示的文件名来自上传文件本身。"""
-        name = f"{_safe_token(album_name)}_{_mark(im)}.{im.ext or 'jpg'}"
-        path = self.staging / name
-        try:
-            path.write_bytes(blob)
-            return await nc.upload_file(gid, album_id, album_name, path)
-        finally:
+        album: tuple[str, str],
+        files: list[tuple[Image, Path]],
+        prefix: str = "",
+    ) -> None:
+        album_id, album_name = album
+        folder = files[0][1].parent.name
+        existing = ""
+        if self.config.get("skip_exists", True):
+            existing = await self._existing_names(nc, gid, album_id)
+        todo = [(im, p) for im, p in files if not _mark(im) or _mark(im) not in existing]
+        dup = len(files) - len(todo)
+        if not todo:
+            await self._reply(
+                event,
+                f"相册「{album_name}」里已经有这 {len(files)} 张图了，无需重复上传",
+            )
+            return
+        start = f"开始上传 {len(todo)} 张到相册「{album_name}」"
+        if dup:
+            start += f"（另有 {dup} 张相册里已有，跳过）"
+        await self._reply(event, f"{prefix}\n{start}" if prefix else start)
+
+        before = await self._media_count(nc, gid, album_id)
+        ok, fails, modes = 0, [], Counter()
+        interval = self._num("upload_interval", 1.5, float)
+        for im, path in todo:
             try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                modes[await nc.upload_file(gid, album_id, album_name, path)] += 1
+                ok += 1
+            except (NapCatError, OSError) as e:
+                fails.append(f"{_mark(im)}：{e}")
+                self.logger.warning(f"[weibo_album] 上传失败 {im.url}: {e}")
+            if interval:
+                await asyncio.sleep(interval)
+        if ok:
+            self._pending.pop(gid, None)
+
+        after = await self._media_count(nc, gid, album_id)
+        gained = after - before if (before >= 0 and after >= 0) else -1
+        msg = f"上传完成：成功 {ok}/{len(todo)} 张 -> 相册「{album_name}」"
+        if gained >= 0:
+            msg += f"，相册新增 {gained} 张"
+        if modes:
+            msg += f"（{modes.most_common(1)[0][0]} 方式）"
+        msg += f"，本地 {folder}/ 已保留"
+        if fails:
+            msg += "\n失败明细：\n" + "\n".join(fails[:5])
+            if len(fails) > 5:
+                msg += f"\n…另有 {len(fails) - 5} 张失败"
+        await self._reply(event, msg)
 
     async def _media_count(self, nc: NapCatAlbum, gid: str, album_id: str) -> int:
         try:
@@ -350,7 +477,7 @@ class WeiboAlbumPlugin(Star):
     @filter.command("绑定相册")
     @filter.permission_type(filter.PermissionType.GROUP_ADMIN)
     async def bind_album(self, event: AstrMessageEvent, text: GreedyStr):
-        """绑定本群默认相册（群管理员）：/绑定相册 <相册名>"""
+        """绑定本群默认相册（群管理员）：/绑定相册 <相册名>。不绑定也行，每次传的时候现选。"""
         event.stop_event()
         gid = str(event.get_group_id() or "")
         if not gid:

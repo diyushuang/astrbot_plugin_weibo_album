@@ -38,6 +38,13 @@
     "default": true,
     "hint": "按微博图片 pid 与相册内文件名比对，重复执行同一条微博不会传重"
   },
+  "keep_days": {
+    "description": "本地批次目录保留天数",
+    "type": "int",
+    "default": 7,
+    "hint": "抓到的原图会留在 data/astrbot_plugin_weibo_album/albums/<批次>/ 里方便筛选和重传，超过这个天数才清理；填 0 表示永久保留",
+    "obvious_hint": true
+  },
   "request_timeout": {
     "description": "微博请求超时（秒）",
     "type": "int",
