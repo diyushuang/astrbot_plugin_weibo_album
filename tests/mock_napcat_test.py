@@ -6,6 +6,7 @@ aiocqhttp 那一侧的行为——成功返回 data，失败抛 ActionFailed(ret
 错误文案与 retcode 严格照抄 NapCatQQ 源码的真实行为，不要"顺手编一个"：
 - 未知接口：`不支持的API <action>` + retcode 1404
 - 取不到文件：`ENOENT: no such file or directory, open ''` + retcode 1400
+  （跨容器部署时 NapCat 看不见插件写的路径，抛的就是这个）
 - 参数校验失败：retcode 1400（不是 1400 之外的什么语义码）
 - 相册接口不会产出 1401/1404 这类语义码，语义只在 message 里
 上一轮审计就是因为 mock 用了 "failed to read file" 这种自创文案，才让 base64 降级链
@@ -185,13 +186,27 @@ async def main():
         )
         print("[ok] 频控类错误会在同一载荷方式内退避重试")
 
-        fake.reject_path = 2  # path 与 file:// 都读不到，模拟 NapCat 在另一台机器
+        fake.reject_path = 5  # NapCat 在另一个容器，一直看不见插件写的路径
         before = len(fake.seen)
         mode = await nc.upload_file("123456", aid, "微博原图", small)
         assert mode == "base64", mode
-        assert len(fake.seen) - before == 3, len(fake.seen) - before
+        assert len(fake.seen) - before == 2, len(fake.seen) - before
         assert fake.sizes[-1] == 4096, fake.sizes[-1]
         print("[ok] 真实 ENOENT 文案下仍能降级到 base64，图片字节数一致")
+
+        # 学到的方式会排到最前：下一张不该再拿路径去撞一次
+        before = len(fake.seen)
+        mode = await nc.upload_file("123456", aid, "微博原图", small)
+        assert mode == "base64" and len(fake.seen) - before == 1, (
+            mode,
+            len(fake.seen) - before,
+        )
+        assert nc.modes[0] == "base64", nc.modes
+        print("[ok] 载荷方式学一次就记住，整批不会再各撞一次 ENOENT")
+
+        nc_preferred = NapCatAlbum(fake.caller, preferred="base64")
+        assert nc_preferred.modes == ["base64", "path"], nc_preferred.modes
+        print("[ok] preferred=base64 时开局就排好顺序（跨容器部署零失败探测）")
 
         missing = tmp / "不存在.jpg"
         try:

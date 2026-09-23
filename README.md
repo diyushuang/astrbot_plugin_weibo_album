@@ -76,7 +76,7 @@
 | `max_pages` | `3` | 抓博主时间线/图集容器时的翻页数 |
 | `upload_concurrency` | `3` | 同时在传相册的张数。NapCat 每张图要在内部串行发几十个分片请求，串行传整批非常慢；调大更快，开始报"频繁"就往下调，填 `1` 回到串行 |
 | `upload_interval` | `0.5` | 每隔这么多秒再放一张进上传队列（错开起点），撞频控时调大到 1~2，填 `0` 一次性全部发起 |
-| `skip_exists` | `true` | 按图片 pid 比对相册已有文件名，重复执行同一条微博不会传重 |
+| `skip_exists` | `true` | 不重复上传已经传过的图：既比对相册里的文件名，也比对本插件自己的上传记录（每个相册留 30 天 / 2000 条） |
 | `request_timeout` | `25` | 微博请求超时 |
 | `proxy` | 空 | 形如 `http://127.0.0.1:7890` |
 
@@ -104,12 +104,14 @@
 - 权限装饰器用 `filter.PermissionType.ADMIN`，不用 `GROUP_ADMIN`：v4.28.0 及更早的 `PermissionType`
   只有 `ADMIN`/`MEMBER` 两个成员，写 `GROUP_ADMIN` 会在 **import 阶段** 就 `AttributeError`、
   整个插件加载失败。`ADMIN` 的判定本来就是 `event.is_admin()`，语义也正是"群管理员"。
-- 上传载荷按 **本地路径 → `file://` → `base64://`** 依次尝试：相册里显示的文件名来自上传文件本身
-  （NapCat 对 base64 载荷用 `randomUUID` 命名，对本地路径取 `basename`），所以先把图片落成本地文件
-  再传，文件名是**整串微博 pid**（`<pid>.jpg`）。不能截断：同一位博主的 pid 前若干位是公共前缀，
-  实测一条微博 18 张图的前 10 位完全相同，截断当唯一键会把整批图写进同一个文件、
-  最后 18 次上传的是同一张。NapCat 与 AstrBot 不同机时路径会抛
-  `ENOENT: no such file or directory`，插件把这识别成"换下一种载荷"而不是"接口不存在"，自动降级 base64。
+- 上传载荷只有 **本地路径 → `base64://`** 两种候选（`file://` 那种写法 NapCat 的 `checkUriType` 认不出来，
+  只会把路径解析成空串、抛 `ENOENT: ... open ''`，所以直接删了）。相册里显示的文件名来自上传文件本身，
+  base64 载荷会被 NapCat 用 `randomUUID` 改名，本地路径才保留 `<pid>.jpg`，所以先默认试路径。
+  **但跨容器/跨机器时 NapCat 看不见插件写的路径**（例如 AstrBot 在 `/AstrBot`、NapCat 在 `/app/napcat`），
+  每张图都会抛一条 ENOENT。插件把这识别成"换下一种载荷"而不是失败，并且**学一次就记住**：
+  同批其余图直接走能用的那种，学到的方式还写进 KV 跨重启保留，所以正常最多在第一批的第一张撞一次错误。
+  文件名不能截断：同一位博主的 pid 前若干位是公共前缀，实测一条微博 18 张图前 10 位完全相同，
+  截断当唯一键会把整批图写进同一个文件、最后 18 次上传的是同一张。
 - **一次调用只能一张，批量靠并发**。NapCat 的相册 action 全集就在 `action/router.ts` 里，唯一的上传口
   是 `upload_image_to_qun_album`，载荷写死 `file: Type.String`；底层 `WebApi.uploadImageToQunAlbum(gc, albumId, albumName, path)`
   也只收一个路径。慢的真正原因在它内部：`uploadQunAlbumSlice(..., slice_size=16384)` 对每张图**串行**
@@ -126,6 +128,10 @@
 - NapCat 上传成功不返回图片 id，所以插件在上传前后各读一次相册媒体列表：上传前用它做去重跳过，
   上传后用差集回报「相册新增 N 张」，读不到只降级为提示、不影响上传本身。媒体列表的 `has_more`
   在上游类型声明里并不存在，缺字段时改按 `attach_info` 是否还在往前走来判断，不会只翻一页就停。
+- 去重不能只靠相册文件名：**base64 载荷被 NapCat 改名成 randomUUID**，跨容器部署下文件名里根本没有
+  微博 pid。所以插件另记一份"本相册传过哪些 pid"的台账（按 `群号+相册ID` 存在 KV 里，30 天过期、
+  每相册上限 2000 条）。代价是：如果有人在 QQ 里手动清空了这个相册，30 天内重传同一条微博会被台账挡下来，
+  提示"之前已经传进"，等记录过期即可，或者换个相册传。
 - 指令第一件事就是 `event.stop_event()`，避免链接解析类插件把同一批图再往群里刷一遍。
   AstrBot 的管道一旦发现事件已停止就不会再跑 RespondStage，所以本插件**所有**回复都走
   `event.send()` 直发，而不是 `yield`（`yield` 在 stop 之后会被静默丢掉）。
@@ -134,7 +140,7 @@
 ## 测试
 
 ```bash
-python tests/mock_napcat_test.py     # 客户端契约：翻页解析、三段载荷降级、频控重试、错误分类、不重试不支持的接口
+python tests/mock_napcat_test.py     # 客户端契约：翻页解析、载荷降级与"学一次就记住"、频控重试、错误分类、不重试不支持的接口
 python tests/test_plugin_e2e.py      # 端到端：真实微博抓取 + 假 NapCat 相册，含两阶段流程
 ```
 
@@ -148,7 +154,8 @@ python tests/test_plugin_e2e.py      # 端到端：真实微博抓取 + 假 NapC
 相册名回查、新增数校验、重复执行去重且提示真的发出去、`skip_exists` 关闭后照常重传、
 小程序文本、裸 ID、不写相册名时列相册待选、`/传相册` 走编号/相册名/默认绑定三条路、
 传完清掉待上传批次、解绑与权限登记、`max_images` 截断、调用带 `self_id` 路由、
-非 NapCat 平台时明确拒绝、真实 ENOENT 降级 base64、私聊/相册不存在/空参数提示、
+非 NapCat 平台时明确拒绝、真实 ENOENT 降级 base64、跨容器时整批只探测一次载荷且后续批次零 ENOENT、
+相册文件名被 NapCat 改成 randomUUID 时按上传记录去重、私聊/相册不存在/空参数提示、
 同群并发被锁挡住、预览、本地暂存传完即删（跑完一轮后 albums/ 下必须一个不剩）。
 
 同一次运行内会缓存微博抓取结果（首个仍是真实网络），否则 9 个上传环节会打出 160+ 次请求。

@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import types
+import uuid
 from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +36,7 @@ N_PICS = 18
 # OneBot 连接对面的假 NapCat；main() 开头填好，make_event 默认按"来自 aiocqhttp 平台"造事件。
 EVENT_BASE: type = object
 EVENT_BOT = None
+EVENT_PLUGIN = None
 
 
 class GreedyStr(str):
@@ -406,7 +408,10 @@ class FakeNapCat:
                 store["reject_path"] -= 1
                 raise ActionFailed(1400, "ENOENT: no such file or directory, open ''")
             if p is None:
-                size, mode, name = len(base64.b64decode(val[9:])), "base64", ""
+                # NapCat 的 checkUriType 对 base64 载荷用 randomUUID 落盘，
+                # 相册里显示的文件名就是它 —— 微博 pid 再也对不上了
+                size = len(base64.b64decode(val[9:]))
+                mode, name = "base64", f"{uuid.uuid4().hex}.jpg"
             else:
                 size, mode = (
                     (p.stat().st_size if p.exists() else -1),
@@ -420,13 +425,20 @@ class FakeNapCat:
 
 
 def reset_store(store):
+    """清空假 NapCat 的相册内容，同时清掉插件"传过哪些图"的记录。
+
+    记录是插件自己对相册内容的记忆，相册空了它就该一起空。
+    """
     store["uploads"] = []
     store["media"] = []
     store["calls"] = []
+    if EVENT_PLUGIN is not None:
+        for k in [k for k in EVENT_PLUGIN._kv if k.startswith("sent:")]:
+            EVENT_PLUGIN._kv[k] = {}
 
 
 async def main():
-    global EVENT_BOT
+    global EVENT_BOT, EVENT_PLUGIN
 
     flt, Star, _, registered = install_fake_astrbot()
     store = {"uploads": [], "media": [], "calls": [], "reject_path": 0}
@@ -445,7 +457,9 @@ async def main():
 
         # ---- 契约 0：签名必须能被真实 CommandFilter 绑定（上一轮的 P0 就在这）
         plugin = module.WeiboAlbumPlugin(context=None, config=dict(CONFIG))
+        EVENT_PLUGIN = plugin
         await plugin.initialize()
+        assert plugin.payload == "", "新实例的载荷方式应该从空开始（第一次探测）"
         rt = FakeCommandRouter(
             plugin,
             registered["commands"],
@@ -509,7 +523,7 @@ async def main():
         assert len(store["uploads"]) == before, (
             f"去重没生效，又多传了 {len(store['uploads']) - before} 张"
         )
-        assert any("已经有" in s and "无需重复上传" in s for s in ev2.sent), ev2.sent
+        assert any("之前已经传进" in s and "无需重复上传" in s for s in ev2.sent), ev2.sent
         print(
             "[ok] 用例2 重复执行按 pid 去重，并且提示确实发出去了（stop_event 后不再丢消息）"
         )
@@ -695,6 +709,46 @@ async def main():
         batches = list(plugin.root.glob("*"))
         assert not batches, f"暂存目录没清干净: {[b.name for b in batches][:3]}"
         print("[ok] 用例13 预览/相册列表正常，本地暂存一批没剩（传完即删）")
+
+        # ---- 用例 14：NapCat 在另一个容器时，载荷只探测一次；去重改用自己的记录
+        reset_store(store)
+        plugin.payload = ""  # 当作刚重启，还没学过哪种载荷能用
+        store["reject_path"] = 999  # 插件写的路径，NapCat 那边一直读不到
+        plugin.config["upload_concurrency"] = 1  # 串行才看得出"只探一次"
+        ev17 = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev17)
+        assert len(store["uploads"]) == N_PICS, ev17.sent[-1]
+        assert {u["_mode"] for u in store["uploads"]} == {"base64"}
+        probes = 999 - store["reject_path"]
+        assert probes == 1, f"整批撞了 {probes} 次路径载荷，NapCat 侧会刷同样多条 ENOENT"
+        assert plugin.payload == "base64", plugin.payload
+        print("[ok] 用例14a 跨容器时只有第一张探测路径载荷，同批其余直接 base64")
+
+        reset_store(store)
+        store["reject_path"] = 999
+        ev17b = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev17b)
+        assert 999 - store["reject_path"] == 0, "后续批次开局就该记住用 base64"
+        assert len(store["uploads"]) == N_PICS, ev17b.sent[-1]
+        store["reject_path"] = 0
+        assert any("上传完成" in s for s in ev17b.sent), ev17b.sent[-1]
+        ledger = {k: len(v) for k, v in plugin._kv.items() if k.startswith("sent:")}
+        assert sum(ledger.values()) >= N_PICS, ledger
+        print("[ok] 用例14b 学到的载荷方式跨批次保留，NapCat 侧零条 ENOENT")
+
+        # base64 载荷会被 NapCat 改名成 randomUUID，相册文件名里没有 pid —— 只能靠记录去重
+        assert all(re.match(r"^[0-9a-f]{32}\.jpg$", n) for n in store["media"]), (
+            store["media"][:2]
+        )
+        before18 = len(store["uploads"])
+        ev18 = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev18)
+        assert len(store["uploads"]) == before18, (
+            f"相册文件名对不上 pid，第二次执行又多传了 {len(store['uploads']) - before18} 张"
+        )
+        assert any("之前已经传进" in s for s in ev18.sent), ev18.sent
+        plugin.config["upload_concurrency"] = 3
+        print("[ok] 用例14c 相册文件名对不上 pid 时，第二次执行按上传记录跳过")
 
         await plugin.terminate()
         print("\n全部用例通过")

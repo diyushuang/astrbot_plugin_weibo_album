@@ -17,6 +17,9 @@ import re
 from pathlib import Path
 
 ALBUM_LIST_ITEM_ID_KEYS = ("album_id", "albumId", "albumIdB64", "id", "bmpno")
+# 上传载荷的候选方式。file:// 那种写法 NapCat 的 checkUriType 认不出来，只会把
+# 路径解析成空串、抛 ENOENT: ... open ''，所以只留真能用的两种。
+PAYLOAD_MODES = ("path", "base64")
 ALBUM_LIST_ITEM_NAME_KEYS = ("album_name", "albumName", "name", "title")
 # 相册条目的"名字"字段：QQ 相册里显示的文件名就来自这里，去重要靠它。
 # NapCat 对这个接口没有声明返回类型（ReturnSchema = Type.Any），只能多键兜。
@@ -126,11 +129,21 @@ def _fail(action: str, detail: str, code: int = 0) -> NapCatError:
 class NapCatAlbum:
     """走调用方注入的 caller —— 也就是 AstrBot 已经和 NapCat 建好的那条 OneBot 连接。"""
 
-    def __init__(self, caller, retries: int = 2):
+    def __init__(self, caller, retries: int = 2, preferred: str = ""):
         if caller is None:
             raise NapCatError("拿不到 AstrBot 与 NapCat 之间的连接")
         self.caller = caller
         self.retries = retries
+        self.modes = self._ordered(preferred)
+
+    @staticmethod
+    def _ordered(preferred: str) -> list[str]:
+        """把上次验证过能用的载荷方式排到最前（默认先试本地路径）。"""
+        modes = list(PAYLOAD_MODES)
+        if preferred in modes:
+            modes.remove(preferred)
+            modes.insert(0, preferred)
+        return modes
 
     async def call(self, action: str, **params) -> dict:
         body = {k: v for k, v in params.items() if v is not None}
@@ -265,10 +278,12 @@ class NapCatAlbum:
     async def upload_file(
         self, group_id: str, album_id: str, album_name: str, path: Path
     ) -> str:
-        """按 本地路径 -> file:// -> base64 依次尝试，返回命中的方式。
+        """按 self.modes 的顺序试载荷，返回命中的方式。
 
-        优先给路径有两个原因：相册里显示的文件名来自上传文件本身（NapCat 对
-        base64 载荷会用 randomUUID 命名），且省掉一次 ~1.37 倍的内存放大。
+        本地路径只有 NapCat 与 AstrBot 在同一台机器上时才读得到，好处是相册里的文件名
+        来自文件本身（base64 载荷会被 NapCat 用 randomUUID 命名）且省掉一次内存放大。
+        跨容器部署时 NapCat 看不见插件写的路径，抛的就是 ENOENT —— 那属于"载荷不行"，
+        换下一种而不是整批失败；学到的可用方式会排到最前，别让每张图都再撞一遍错误。
         """
         try:
             raw = path.read_bytes()
@@ -276,25 +291,28 @@ class NapCatAlbum:
             raise NapCatError(f"读取待上传图片失败 {path.name}: {e}") from e
         if not raw:
             raise NapCatError("图片数据为空")
-        absolute = str(path.resolve())
+        values = {
+            "path": str(path.resolve()),
+            "base64": "base64://" + base64.b64encode(raw).decode("ascii"),
+        }
         errs: list[str] = []
-        for mode, value in (
-            ("path", absolute),
-            ("file_uri", f"file://{absolute}"),
-            ("base64", "base64://" + base64.b64encode(raw).decode("ascii")),
-        ):
+        for mode in list(self.modes):
             try:
                 await self.call(
                     "upload_image_to_qun_album",
                     group_id=str(group_id),
                     album_id=str(album_id),
                     album_name=str(album_name or ""),
-                    file=value,
+                    file=values[mode],
                 )
-                return mode
             except NapCatError as e:
                 errs.append(f"{mode}: {e}")
                 # 接口本身不存在，换载荷格式也一样；业务/权限错误同理，直接上抛
                 if e.action_missing or not e.file_unusable:
                     raise
-        raise NapCatError(" | ".join(errs[-2:]))
+                continue
+            if self.modes[0] != mode:  # 学到的可用方式排到最前，后面别再撞错误了
+                self.modes.remove(mode)
+                self.modes.insert(0, mode)
+            return mode
+        raise NapCatError(" | ".join(errs))

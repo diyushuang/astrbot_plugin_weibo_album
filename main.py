@@ -33,6 +33,8 @@ from .weibo_client import ANY_URL_RE, Image, WeiboClient, WeiboError
 PREFETCH = 5  # 下载并发度：整批先落到本地，之后才传相册
 UPLOAD_CONC = 3  # 同时在传的张数。 NapCat 每张图内部要串行发几十个 16KB 分片，串行太慢
 PENDING_TTL = 1800  # 下载完等 /传相册 选相册的存活时间
+LEDGER_TTL = 30 * 86400  # "本插件传过这张"的记录留多久
+LEDGER_MAX = 2000  # 每个相册最多记多少条
 MAX_ALBUM_CHOICES = 15  # 选择列表一次最多列几个相册
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\s]+')
 
@@ -87,6 +89,7 @@ class WeiboAlbumPlugin(Star):
         self._wb: WeiboClient | None = None
         self._locks: dict[str, asyncio.Lock] = {}
         self._pending: dict[str, dict] = {}  # gid -> 下载完在等 /传相册 指定相册的那批图
+        self.payload = ""  # 上次验证过能用的载荷方式（path / base64）
         data_dir = StarTools.get_data_dir(
             getattr(self, "name", None) or "astrbot_plugin_weibo_album"
         )
@@ -95,6 +98,7 @@ class WeiboAlbumPlugin(Star):
     async def initialize(self):
         self.root.mkdir(parents=True, exist_ok=True)
         self._wipe_leftovers()
+        self.payload = await self.get_kv_data("payload", "") or ""
         await self._get_session()
 
     async def terminate(self):
@@ -173,7 +177,7 @@ class WeiboAlbumPlugin(Star):
             # bot.call_action 上（AstrBot 自己也是这么调的），它没有 .api 这层。
             return await bot.call_action(action, **params)
 
-        return NapCatAlbum(caller)
+        return NapCatAlbum(caller, preferred=self.payload)
 
     async def _default_album(self, gid: str) -> str:
         return (
@@ -381,6 +385,32 @@ class WeiboAlbumPlugin(Star):
             f"{head}\n传到哪个相册？\n" + "\n".join(lines) + f"\n/传相册 <编号或相册名>（{tip}）",
         )
 
+    @staticmethod
+    def _ledger_key(gid: str, album_id: str) -> str:
+        return f"sent:{gid}:{album_id}"
+
+    async def _sent_marks(self, gid: str, album_id: str) -> set[str]:
+        """本插件往这个相册传过哪些图（按 pid 记）。
+
+        跨机器时 NapCat 会把 base64 载荷改名成 randomUUID，相册里的文件名就不再含微博
+        pid 了，只靠回读文件名去重会失效，所以自己记一份。
+        """
+        raw = await self.get_kv_data(self._ledger_key(gid, album_id), {}) or {}
+        now = time.time()
+        return {m for m, ts in dict(raw).items() if now - float(ts) < LEDGER_TTL}
+
+    async def _remember(self, gid: str, album_id: str, marks: list[str]) -> None:
+        if not marks:
+            return
+        key = self._ledger_key(gid, album_id)
+        raw = dict(await self.get_kv_data(key, {}) or {})
+        now = time.time()
+        sent = {m: float(ts) for m, ts in raw.items() if now - float(ts) < LEDGER_TTL}
+        sent.update(dict.fromkeys(marks, now))
+        if len(sent) > LEDGER_MAX:
+            sent = dict(sorted(sent.items(), key=lambda kv: kv[1])[-LEDGER_MAX:])
+        await self.put_kv_data(key, sent)
+
     async def _upload(
         self,
         event: AstrMessageEvent,
@@ -395,23 +425,31 @@ class WeiboAlbumPlugin(Star):
         conc = max(1, self._num("upload_concurrency", UPLOAD_CONC))
         interval = self._num("upload_interval", 0.5, float)
         existing = ""
+        sent: set[str] = set()
         if self.config.get("skip_exists", True):
             existing = await self._existing_names(nc, gid, album_id)
-        todo = [(im, p) for im, p in files if not _mark(im) or _mark(im) not in existing]
+            sent = await self._sent_marks(gid, album_id)
+
+        def already(im: Image) -> bool:
+            mark = _mark(im)
+            return bool(mark) and (mark in existing or mark in sent)
+
+        todo = [(im, p) for im, p in files if not already(im)]
         dup = len(files) - len(todo)
         if not todo:
             await self._reply(
                 event,
-                f"相册「{album_name}」里已经有这 {len(files)} 张图了，无需重复上传",
+                f"这 {len(files)} 张之前已经传进相册「{album_name}」了，无需重复上传"
+                f"（记录保留 {LEDGER_TTL // 86400} 天，清空相册后等它过期或改天再传）",
             )
             return
         start = f"开始上传 {len(todo)} 张到相册「{album_name}」（{conc} 张并发）"
         if dup:
-            start += f"（另有 {dup} 张相册里已有，跳过）"
+            start += f"（另有 {dup} 张已传过，跳过）"
         await self._reply(event, f"{prefix}\n{start}" if prefix else start)
 
         before = await self._media_count(nc, gid, album_id)
-        ok, fails, modes = 0, [], Counter()
+        ok, fails, modes, done = 0, [], Counter(), []
         sem = asyncio.Semaphore(conc)
 
         async def push(im: Image, path: Path):
@@ -427,6 +465,8 @@ class WeiboAlbumPlugin(Star):
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
+                if _mark(im):
+                    done.append(_mark(im))
                 return mode, ""
 
         tasks = []
@@ -447,6 +487,14 @@ class WeiboAlbumPlugin(Star):
             pass
         if ok:
             self._pending.pop(gid, None)
+            await self._remember(gid, album_id, done)
+        if modes:
+            learned = modes.most_common(1)[0][0]
+            if learned != self.payload:
+                # 记住哪种载荷能用：跨容器部署下每张图都先撞一次路径载荷，
+                # NapCat 那边就会刷一整屏 ENOENT
+                self.payload = learned
+                await self.put_kv_data("payload", learned)
 
         after = await self._media_count(nc, gid, album_id)
         gained = after - before if (before >= 0 and after >= 0) else -1
