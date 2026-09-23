@@ -169,7 +169,9 @@ class WeiboAlbumPlugin(Star):
         async def caller(action: str, params: dict):
             if self_id:
                 params["self_id"] = self_id
-            return await bot.api.call_action(action, **params)
+            # AiocqhttpMessageEvent.bot 是 aiocqhttp 的 CQHttp 实例，动作口就在
+            # bot.call_action 上（AstrBot 自己也是这么调的），它没有 .api 这层。
+            return await bot.call_action(action, **params)
 
         return NapCatAlbum(caller)
 
@@ -511,7 +513,7 @@ class WeiboAlbumPlugin(Star):
             await self._reply(event, f"失败：{e}")
 
     @filter.command("绑定相册")
-    @filter.permission_type(filter.PermissionType.GROUP_ADMIN)
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def bind_album(self, event: AstrMessageEvent, text: GreedyStr):
         """绑定本群默认相册（群管理员）：/绑定相册 <相册名>。不绑定也行，每次传的时候现选。"""
         event.stop_event()
@@ -532,7 +534,7 @@ class WeiboAlbumPlugin(Star):
             await self._reply(event, f"失败：{e}")
 
     @filter.command("解绑相册")
-    @filter.permission_type(filter.PermissionType.GROUP_ADMIN)
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def unbind_album(self, event: AstrMessageEvent):
         """解除本群默认相册绑定（群管理员）。"""
         event.stop_event()

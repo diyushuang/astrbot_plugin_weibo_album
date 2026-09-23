@@ -12,6 +12,7 @@ event.send 收到裸 str 也不报错。
 
 import asyncio
 import base64
+import enum
 import importlib
 import inspect
 import os
@@ -107,10 +108,16 @@ def install_fake_astrbot():
 
             return deco
 
-        class PermissionType:
-            ADMIN = "admin"
-            MEMBER = "member"
-            GROUP_ADMIN = "group_admin"
+        class PermissionType(enum.Flag):
+            """照抄 astrbot/core/star/filter/permission.py @ v4.28.0。
+
+            这一版只有 ADMIN/MEMBER —— GROUP_ADMIN 是 master 上才加的。上一轮替身里
+            自创了 GROUP_ADMIN 这个成员，插件 import 阶段就 AttributeError 整个加载失败，
+            替身却没报任何问题：枚举成员名必须照抄用户实际跑的那个版本。
+            """
+
+            ADMIN = enum.auto()
+            MEMBER = enum.auto()
 
     flt = Filter()
     ev = mod("astrbot.api.event")
@@ -181,8 +188,10 @@ class FakeCommandRouter:
     "所有指令根本进不到函数体" 的问题一定会在这里暴露，而不是被绕过。
     """
 
-    def __init__(self, plugin, specs):
+    def __init__(self, plugin, specs, perms=None, perm_admin=None):
         self.plugin = plugin
+        self.perms = perms or {}
+        self.perm_admin = perm_admin
         self.params: dict[str, dict] = {}
         self.target: dict[str, str] = {}
         for name, fn_name, alias in specs:
@@ -239,7 +248,12 @@ class FakeCommandRouter:
             rest = message_str[len(cmd) :].strip()
             ls = [p for p in rest.split(" ") if p]
             bound = self._convert(ls, pt)  # 这里会如实抛 TypeError / ValueError
-            fn = getattr(self.plugin, self.target[cmd])
+            fn_name = self.target[cmd]
+            need = self.perms.get(fn_name)
+            # 照抄 v4.28.0 的 PermissionTypeFilter.filter：ADMIN 且不是管理员就不执行
+            if need is not None and need == self.perm_admin and not event.is_admin():
+                return None
+            fn = getattr(self.plugin, fn_name)
             # _params 是按未绑定函数算的（跳过了 self 和 event），所以 event 要显式给
             await fn(event, **bound)
             return bound
@@ -416,7 +430,8 @@ async def main():
 
     flt, Star, _, registered = install_fake_astrbot()
     store = {"uploads": [], "media": [], "calls": [], "reject_path": 0}
-    EVENT_BOT = types.SimpleNamespace(api=FakeNapCat(store))
+    # event.bot 是 aiocqhttp 的 CQHttp：动作口是 bot.call_action，没有 .api 这一层
+    EVENT_BOT = types.SimpleNamespace(call_action=FakeNapCat(store).call_action)
 
     module, tmp = import_plugin()
     cache_network(module)
@@ -431,7 +446,12 @@ async def main():
         # ---- 契约 0：签名必须能被真实 CommandFilter 绑定（上一轮的 P0 就在这）
         plugin = module.WeiboAlbumPlugin(context=None, config=dict(CONFIG))
         await plugin.initialize()
-        rt = FakeCommandRouter(plugin, registered["commands"])
+        rt = FakeCommandRouter(
+            plugin,
+            registered["commands"],
+            registered["permissions"],
+            flt.PermissionType.ADMIN,
+        )
         assert "wbalbum" in rt.cmd_names(), "别名没有注册上"
         for fn_name in ("grab_to_album", "preview", "bind_album"):
             fn = getattr(type(plugin), fn_name)
@@ -586,13 +606,21 @@ async def main():
         assert all(u["album_id"] == "0_aaaaaaaa" for u in store["uploads"])
         print("[ok] 用例6b 编号/相册名/指令里直接带名字都能盖掉绑定的默认相册")
 
-        # ---- 用例 7：解绑 + 权限过滤确实挂在绑定/解绑上
+        # ---- 用例 7：解绑 + 权限过滤确实挂在绑定/解绑上，普通成员被挡在外面
         await rt.dispatch("解绑相册", make_event(""))
         assert await plugin.get_kv_data("album:123456", "") == ""
         perms = registered["permissions"]
-        assert perms.get("bind_album") == flt.PermissionType.GROUP_ADMIN, perms
-        assert perms.get("unbind_album") == flt.PermissionType.GROUP_ADMIN, perms
-        print("[ok] 用例7 解绑生效，且绑定/解绑都登记了群管理员权限要求")
+        assert perms.get("bind_album") == flt.PermissionType.ADMIN, perms
+        assert perms.get("unbind_album") == flt.PermissionType.ADMIN, perms
+        assert hasattr(flt.PermissionType, "GROUP_ADMIN") is False, (
+            "替身不小心用了用户那版没有的成员，等于没在测 v4.28.0"
+        )
+        ev7b = make_event("微博原图", admin=False)
+        await rt.dispatch("绑定相册 微博原图", ev7b)
+        assert not ev7b.sent and await plugin.get_kv_data("album:123456", "") == "", (
+            "普通成员竟然把绑定改掉了"
+        )
+        print("[ok] 用例7 解绑生效；绑定/解绑登记了 ADMIN 权限，且普通成员被过滤掉")
 
         # ---- 用例 8：max_images 截断
         reset_store(store)

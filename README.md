@@ -96,9 +96,14 @@
 
 ## 上传侧的做法
 
-- 传输只有一条路：复用 AstrBot 与 NapCat 之间已经建好的那条 OneBot 连接（`event.bot.api.call_action`，
+- 传输只有一条路：复用 AstrBot 与 NapCat 之间已经建好的那条 OneBot 连接（`event.bot.call_action`，
   并按 `self_id` 路由到对应的那个适配器）。地址、token 都是 AstrBot 适配器的事，插件不另配一份；
   消息不是来自 aiocqhttp 平台时直接告知"这条消息所在的平台调不到群相册接口"。
+  注意 `event.bot` 是 aiocqhttp 的 `CQHttp` 实例，动作口就在 `bot.call_action` 上，**没有 `.api` 这一层**
+  （AstrBot 自己的 aiocqhttp 适配器也是这么调的）。
+- 权限装饰器用 `filter.PermissionType.ADMIN`，不用 `GROUP_ADMIN`：v4.28.0 及更早的 `PermissionType`
+  只有 `ADMIN`/`MEMBER` 两个成员，写 `GROUP_ADMIN` 会在 **import 阶段** 就 `AttributeError`、
+  整个插件加载失败。`ADMIN` 的判定本来就是 `event.is_admin()`，语义也正是"群管理员"。
 - 上传载荷按 **本地路径 → `file://` → `base64://`** 依次尝试：相册里显示的文件名来自上传文件本身
   （NapCat 对 base64 载荷用 `randomUUID` 命名，对本地路径取 `basename`），所以先把图片落成本地文件
   再传，文件名是**整串微博 pid**（`<pid>.jpg`）。不能截断：同一位博主的 pid 前若干位是公共前缀，
