@@ -45,6 +45,13 @@
     "default": true,
     "hint": "按微博图片 pid 与相册内文件名比对，重复执行同一条微博不会传重"
   },
+  "same_host": {
+    "description": "NapCat 与 AstrBot 在同一台机器",
+    "type": "bool",
+    "default": false,
+    "hint": "打开后上传相册优先把本地路径当载荷，QQ 相册里的文件名就是微博 pid 而不是一串 randomUUID。只有两边能读到同一个目录时才开（Docker 分容器部署别开），否则每张图会在 NapCat 控制台撞一条 ENOENT 再降级 base64，图片仍能传上",
+    "obvious_hint": true
+  },
   "request_timeout": {
     "description": "微博请求超时（秒）",
     "type": "int",

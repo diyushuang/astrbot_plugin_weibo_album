@@ -5,8 +5,11 @@ aiocqhttp 那一侧的行为——成功返回 data，失败抛 ActionFailed(ret
 
 错误文案与 retcode 严格照抄 NapCatQQ 源码的真实行为，不要"顺手编一个"：
 - 未知接口：`不支持的API <action>` + retcode 1404
-- 取不到文件：`ENOENT: no such file or directory, open ''` + retcode 1400
-  （跨容器部署时 NapCat 看不见插件写的路径，抛的就是这个）
+- 载荷取不到文件 + retcode 1400，两条文案来自 checkUriType 的两个不同分支：
+  裸路径在 NapCat 那边 existsSync 不命中、又不是 http/base64/file/data 前缀 -> Unknown ->
+  `uriToLocalFile` 返回 path='' -> `readFileSync('')` -> `ENOENT: ... open ''`；
+  `file:///abs` 走 `startsWith('file:')` 分支，**不做存在性检查**直接当 Local ->
+  `ENOENT: ... open '/abs'`。
 - 参数校验失败：retcode 1400（不是 1400 之外的什么语义码）
 - 相册接口不会产出 1401/1404 这类语义码，语义只在 message 里
 上一轮审计就是因为 mock 用了 "failed to read file" 这种自创文案，才让 base64 降级链
@@ -132,7 +135,7 @@ class FakeNapCat:
 
 async def main():
     fake = FakeNapCat()
-    nc = NapCatAlbum(fake.caller, retries=2)
+    nc = NapCatAlbum(fake.caller, retries=2, same_host=True)
     tmp = Path(tempfile.mkdtemp(prefix="wbalbum_"))
     try:
         albums = await nc.list_albums("123456")
@@ -204,9 +207,25 @@ async def main():
         assert nc.modes[0] == "base64", nc.modes
         print("[ok] 载荷方式学一次就记住，整批不会再各撞一次 ENOENT")
 
-        nc_preferred = NapCatAlbum(fake.caller, preferred="base64")
+        nc_preferred = NapCatAlbum(fake.caller, preferred="base64", same_host=True)
         assert nc_preferred.modes == ["base64", "path"], nc_preferred.modes
-        print("[ok] preferred=base64 时开局就排好顺序（跨容器部署零失败探测）")
+        print("[ok] 声明同机时 preferred=base64 开局就排好顺序（后续批次零失败探测）")
+
+        # 没声明同机就是默认配置：本地路径压根不发出去试，NapCat 侧一条 ENOENT 都不该有
+        fake.reject_path = 0
+        nc_cross = NapCatAlbum(fake.caller)
+        assert nc_cross.modes == ["base64"], nc_cross.modes
+        fake.reject_path = 99  # NapCat 完全看不见插件写的路径
+        before = len(fake.seen)
+        mode = await nc_cross.upload_file("123456", aid, "微博原图", small)
+        assert mode == "base64" and len(fake.seen) - before == 1, (
+            mode,
+            len(fake.seen) - before,
+        )
+        assert fake.reject_path == 99, "默认配置不该发出本地路径载荷"
+        assert fake.sizes[-1] == 4096, fake.sizes[-1]
+        print("[ok] 默认（未声明同机）只发 base64 载荷，跨容器部署零条 ENOENT")
+        fake.reject_path = 0
 
         missing = tmp / "不存在.jpg"
         try:

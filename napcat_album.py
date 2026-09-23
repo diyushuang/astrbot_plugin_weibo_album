@@ -17,9 +17,6 @@ import re
 from pathlib import Path
 
 ALBUM_LIST_ITEM_ID_KEYS = ("album_id", "albumId", "albumIdB64", "id", "bmpno")
-# 上传载荷的候选方式。file:// 那种写法 NapCat 的 checkUriType 认不出来，只会把
-# 路径解析成空串、抛 ENOENT: ... open ''，所以只留真能用的两种。
-PAYLOAD_MODES = ("path", "base64")
 ALBUM_LIST_ITEM_NAME_KEYS = ("album_name", "albumName", "name", "title")
 # 相册条目的"名字"字段：QQ 相册里显示的文件名就来自这里，去重要靠它。
 # NapCat 对这个接口没有声明返回类型（ReturnSchema = Type.Any），只能多键兜。
@@ -129,17 +126,29 @@ def _fail(action: str, detail: str, code: int = 0) -> NapCatError:
 class NapCatAlbum:
     """走调用方注入的 caller —— 也就是 AstrBot 已经和 NapCat 建好的那条 OneBot 连接。"""
 
-    def __init__(self, caller, retries: int = 2, preferred: str = ""):
+    def __init__(
+        self,
+        caller,
+        retries: int = 2,
+        preferred: str = "",
+        same_host: bool = False,
+    ):
         if caller is None:
             raise NapCatError("拿不到 AstrBot 与 NapCat 之间的连接")
         self.caller = caller
         self.retries = retries
-        self.modes = self._ordered(preferred)
+        self.same_host = same_host
+        self.modes = self._ordered(preferred, same_host)
 
     @staticmethod
-    def _ordered(preferred: str) -> list[str]:
-        """把上次验证过能用的载荷方式排到最前（默认先试本地路径）。"""
-        modes = list(PAYLOAD_MODES)
+    def _ordered(preferred: str, same_host: bool) -> list[str]:
+        """same_host 是调用方对"两边共用文件系统"的声明，只有它成立才允许拿本地路径去试。
+
+        路径在 NapCat 那边读不到时抛的是 ENOENT，插件能把载荷降级掉，但 NapCat 控制台
+        会实实在在刷一条错误 —— 所以不猜、不问，默认只走 base64。
+        preferred 是上次真的传成功过的方式，同机探测过一次就别每张图再撞一遍。
+        """
+        modes = ["path", "base64"] if same_host else ["base64"]
         if preferred in modes:
             modes.remove(preferred)
             modes.insert(0, preferred)
@@ -280,10 +289,15 @@ class NapCatAlbum:
     ) -> str:
         """按 self.modes 的顺序试载荷，返回命中的方式。
 
-        本地路径只有 NapCat 与 AstrBot 在同一台机器上时才读得到，好处是相册里的文件名
-        来自文件本身（base64 载荷会被 NapCat 用 randomUUID 命名）且省掉一次内存放大。
-        跨容器部署时 NapCat 看不见插件写的路径，抛的就是 ENOENT —— 那属于"载荷不行"，
-        换下一种而不是整批失败；学到的可用方式会排到最前，别让每张图都再撞一遍错误。
+        默认只有 base64 一种：NapCat 收到它会先落一个 randomUUID 命名的临时文件再传，
+        任何部署拓扑都读得到，代价是相册里的文件名不再是微博 pid（去重改由调用方记账）。
+
+        same_host=True 时才把本地路径排到最前 —— 这条只有 NapCat 与 AstrBot 共用文件系统
+        才成立，好处是文件名保留 `<pid>.jpg` 且省掉一次 base64 内存放大。插件写不出
+        NapCat 那台机器上的路径，所以拿它去猜就是每张图一条 ENOENT：
+        裸路径在 NapCat 侧 checkUriType 判成 Unknown、readFileSync 收到空串，
+        报 `ENOENT: ... open ''`。猜错不致命（降级到 base64），学到的方式会排到最前，
+        一张图探测一次就够。
         """
         try:
             raw = path.read_bytes()

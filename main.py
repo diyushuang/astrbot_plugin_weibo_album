@@ -36,6 +36,9 @@ PENDING_TTL = 1800  # 下载完等 /传相册 选相册的存活时间
 LEDGER_TTL = 30 * 86400  # "本插件传过这张"的记录留多久
 LEDGER_MAX = 2000  # 每个相册最多记多少条
 MAX_ALBUM_CHOICES = 15  # 选择列表一次最多列几个相册
+# 同机开关打开时，"上次哪种载荷真的传成功过"记在这里：开关一换就是另一个键，
+# 免得以前探测失败的结论一直压着新配置。
+PAYLOAD_KEY = "payload:same_host"
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\s]+')
 
 
@@ -89,16 +92,21 @@ class WeiboAlbumPlugin(Star):
         self._wb: WeiboClient | None = None
         self._locks: dict[str, asyncio.Lock] = {}
         self._pending: dict[str, dict] = {}  # gid -> 下载完在等 /传相册 指定相册的那批图
-        self.payload = ""  # 上次验证过能用的载荷方式（path / base64）
+        self.payload = ""  # 同机探测过能用的载荷方式（path / base64）
         data_dir = StarTools.get_data_dir(
             getattr(self, "name", None) or "astrbot_plugin_weibo_album"
         )
         self.root = Path(data_dir) / "albums"
 
+    @property
+    def same_host(self) -> bool:
+        """用户声明 NapCat 与 AstrBot 共用文件系统，本地路径这种载荷才可能传得动。"""
+        return bool(self.config.get("same_host", False))
+
     async def initialize(self):
         self.root.mkdir(parents=True, exist_ok=True)
         self._wipe_leftovers()
-        self.payload = await self.get_kv_data("payload", "") or ""
+        self.payload = await self.get_kv_data(PAYLOAD_KEY, "") or ""
         await self._get_session()
 
     async def terminate(self):
@@ -177,7 +185,7 @@ class WeiboAlbumPlugin(Star):
             # bot.call_action 上（AstrBot 自己也是这么调的），它没有 .api 这层。
             return await bot.call_action(action, **params)
 
-        return NapCatAlbum(caller, preferred=self.payload)
+        return NapCatAlbum(caller, preferred=self.payload, same_host=self.same_host)
 
     async def _default_album(self, gid: str) -> str:
         return (
@@ -488,13 +496,12 @@ class WeiboAlbumPlugin(Star):
         if ok:
             self._pending.pop(gid, None)
             await self._remember(gid, album_id, done)
-        if modes:
+        if nc.same_host and modes:
             learned = modes.most_common(1)[0][0]
             if learned != self.payload:
-                # 记住哪种载荷能用：跨容器部署下每张图都先撞一次路径载荷，
-                # NapCat 那边就会刷一整屏 ENOENT
+                # 同机探测过一次就别每张图都撞：NapCat 那边会刷一整屏 ENOENT
                 self.payload = learned
-                await self.put_kv_data("payload", learned)
+                await self.put_kv_data(PAYLOAD_KEY, learned)
 
         after = await self._media_count(nc, gid, album_id)
         gained = after - before if (before >= 0 and after >= 0) else -1

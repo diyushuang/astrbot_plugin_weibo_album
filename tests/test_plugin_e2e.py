@@ -15,6 +15,7 @@ import base64
 import enum
 import importlib
 import inspect
+import json
 import os
 import re
 import shutil
@@ -329,6 +330,9 @@ CONFIG = {
     "request_timeout": 25,
     "proxy": "",
     "skip_exists": True,
+    # 这份用例整体演的是"两边共用文件系统"那一档，才看得出本地路径载荷；
+    # 出厂默认（只用 base64）由用例 15 单独演。
+    "same_host": True,
 }
 
 
@@ -358,11 +362,14 @@ def cache_network(module):
 
 
 def file_parts(value):
-    """把 NapCat 收到的 file 字段还原成本地路径；base64 时返回 None。"""
+    """把 NapCat 收到的 file 字段还原成本地路径；base64 载荷返回 None。
+
+    NapCat 的 checkUriType 只认「本机存在的文件、http(s)、base64:、file:、data:」，认不出来
+    就是 Unknown -> path='' -> readFileSync 抛 `ENOENT: ... open ''`。插件只可能发 base64://
+    和裸路径两种，所以这里不再替 file:// 之类的写法兜底。
+    """
     if value.startswith("base64://"):
         return None
-    if value.startswith("file://"):
-        value = value[len("file://") :]
     return Path(value)
 
 
@@ -413,11 +420,8 @@ class FakeNapCat:
                 size = len(base64.b64decode(val[9:]))
                 mode, name = "base64", f"{uuid.uuid4().hex}.jpg"
             else:
-                size, mode = (
-                    (p.stat().st_size if p.exists() else -1),
-                    ("file_uri" if val.startswith("file://") else "path"),
-                )
-                name = p.name
+                size = p.stat().st_size if p.exists() else -1
+                mode, name = "path", p.name
             store["uploads"].append({**params, "_size": size, "_mode": mode})
             store["media"].append(name)
             return None  # uploadImageToQunAlbum 没有 return，data 是 null
@@ -460,6 +464,12 @@ async def main():
         EVENT_PLUGIN = plugin
         await plugin.initialize()
         assert plugin.payload == "", "新实例的载荷方式应该从空开始（第一次探测）"
+        # 用例把 same_host 打开是为了演本地路径载荷，出厂默认必须是关：
+        # 开着它部署到分容器的机器上，每张图都会在 NapCat 控制台撞一条 ENOENT。
+        with open(os.path.join(ROOT, "_conf_schema.json"), encoding="utf-8") as f:
+            schema = json.load(f)
+        assert schema["same_host"]["default"] is False, "默认配置不该拿路径载荷去撞 ENOENT"
+        assert set(CONFIG) <= set(schema), set(CONFIG) - set(schema)
         rt = FakeCommandRouter(
             plugin,
             registered["commands"],
@@ -710,7 +720,7 @@ async def main():
         assert not batches, f"暂存目录没清干净: {[b.name for b in batches][:3]}"
         print("[ok] 用例13 预览/相册列表正常，本地暂存一批没剩（传完即删）")
 
-        # ---- 用例 14：NapCat 在另一个容器时，载荷只探测一次；去重改用自己的记录
+        # ---- 用例 14：声明了同机但两边其实不共用文件系统时，载荷只探测一次；去重改用自己的记录
         reset_store(store)
         plugin.payload = ""  # 当作刚重启，还没学过哪种载荷能用
         store["reject_path"] = 999  # 插件写的路径，NapCat 那边一直读不到
@@ -722,7 +732,7 @@ async def main():
         probes = 999 - store["reject_path"]
         assert probes == 1, f"整批撞了 {probes} 次路径载荷，NapCat 侧会刷同样多条 ENOENT"
         assert plugin.payload == "base64", plugin.payload
-        print("[ok] 用例14a 跨容器时只有第一张探测路径载荷，同批其余直接 base64")
+        print("[ok] 用例14a 同机开关开错时只有第一张探测路径载荷，同批其余直接 base64")
 
         reset_store(store)
         store["reject_path"] = 999
@@ -749,6 +759,19 @@ async def main():
         assert any("之前已经传进" in s for s in ev18.sent), ev18.sent
         plugin.config["upload_concurrency"] = 3
         print("[ok] 用例14c 相册文件名对不上 pid 时，第二次执行按上传记录跳过")
+
+        # ---- 用例 15：出厂默认（没声明同机）根本不发本地路径，跨容器零条 ENOENT
+        reset_store(store)
+        plugin.config["same_host"] = False
+        plugin.payload = "path"  # 就算记忆里存着"路径传成功过"，没声明同机也不该再试
+        store["reject_path"] = 999
+        ev19 = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev19)
+        assert len(store["uploads"]) == N_PICS, ev19.sent[-1]
+        assert all(u["file"].startswith("base64://") for u in store["uploads"])
+        assert store["reject_path"] == 999, "一条路径载荷都不该发出去，NapCat 侧零条 ENOENT"
+        assert plugin.payload == "path", "关掉同机开关后不该改写那条载荷记忆"
+        print("[ok] 用例15 默认配置只发 base64 载荷，NapCat 控制台零条 ENOENT")
 
         await plugin.terminate()
         print("\n全部用例通过")
