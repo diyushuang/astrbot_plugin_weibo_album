@@ -2,7 +2,7 @@ name: astrbot_plugin_weibo_album
 display_name: 微博原图传群相册
 desc: 抓取指定微博链接/微博小程序里的全部原图，并通过 NapCat 上传到 QQ 群相册的指定相册。
 short_desc: 微博原图一键搬进群相册
-version: v1.1.0
+version: v1.2.0
 author: adsm
 repo: https://github.com/adsm/astrbot_plugin_weibo_album
 support_platforms:

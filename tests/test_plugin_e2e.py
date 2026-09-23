@@ -309,7 +309,7 @@ CONFIG = {
     "max_images": 30,
     "max_pages": 2,
     "upload_interval": 0,
-    "keep_days": 7,
+    "upload_concurrency": 3,
     "request_timeout": 25,
     "proxy": "",
     "skip_exists": True,
@@ -472,32 +472,14 @@ async def main():
         ), "走 AstrBot 连接时必须带 self_id 路由到对应的那个 NapCat"
         names_up = [Path(u["file"]).name for u in store["uploads"]]
         assert all(n.endswith((".jpg", ".png", ".gif")) for n in names_up), names_up[:3]
-        assert "已保留" in ev.sent[-1], ev.sent[-1]
-        print(
-            f"[ok] 用例1 真实微博 {N_PICS} 张原图经完整指令链路上传成功，"
-            f"最小 {min(sizes) // 1024}KB，相册名回查正确"
-        )
-
-        # ---- 用例 1b：本地图是有意保留的，可以人工筛选后用 /传相册 再传
-        folders = sorted(plugin.root.glob("*"), key=lambda p: p.name)
-        assert folders, "下载目录不该被删掉"
-        kept = list(folders[-1].glob("*.jpg"))
-        marks = [re.sub(r"\.\w+$", "", p.name) for p in kept]
-        assert len(kept) == N_PICS and len(set(marks)) == N_PICS, (
-            len(kept),
-            len(set(marks)),
-        )
-        assert len({p.stat().st_size for p in kept}) > 1, (
-            "本地文件名撞车了，整批写进了同一个文件"
-        )
+        assert "本地暂存已清理" in ev.sent[-1], ev.sent[-1]
+        assert not list(plugin.root.glob("*")), "传完之后暂存批次该删掉"
         assert len(store["uploads"]) == len(
             {Path(u["file"]).name for u in store["uploads"]}
-        )
-        assert kept[0].stat().st_size > 100_000
+        ), "本地文件名撞车了，整批传的是同一张"
         print(
-            "[ok] 用例1b 这批图留在",
-            folders[-1].name + "/",
-            f"共 {len(kept)} 张，传完没被删",
+            f"[ok] 用例1 真实微博 {N_PICS} 张原图经完整指令链路上传成功，"
+            f"最小 {min(sizes) // 1024}KB，相册名回查正确，传完本地已清理"
         )
 
         # ---- 用例 2：再传一次全部去重跳过，且这条提示真的能发到群里
@@ -530,7 +512,22 @@ async def main():
         assert not store["uploads"], "没指定相册时不该猜一个就传"
         assert any("微博原图" in s and "其他相册" in s for s in ev4.sent), ev4.sent
         assert any("/传相册" in s for s in ev4.sent), ev4.sent
-        print("[ok] 用例4a 小程序分享文本抓到图后列出相册待选，不会误读分享文案")
+        folders = sorted(plugin.root.glob("*"), key=lambda p: p.name)
+        assert folders, "等用户选相册期间，暂存批次必须还在本地"
+        kept = list(folders[-1].glob("*.jpg"))
+        marks = [re.sub(r"\.\w+$", "", p.name) for p in kept]
+        assert len(kept) == N_PICS and len(set(marks)) == N_PICS, (
+            len(kept),
+            len(set(marks)),
+        )
+        assert len({p.stat().st_size for p in kept}) > 1, (
+            "本地文件名撞车了，整批写进了同一个文件"
+        )
+        print(
+            "[ok] 用例4a 小程序分享文本抓到图后列出相册待选，暂存",
+            len(kept),
+            "张各占一个文件（pid 前 10 位相同也能分开）",
+        )
 
         ev4b = make_event("1")
         await rt.dispatch("传相册 1", ev4b)
@@ -541,7 +538,8 @@ async def main():
             "get_qun_album_list",
             "upload_image_to_qun_album",
         }
-        print("[ok] 用例4b /传相册 1 按编号选中第一个相册并整批上传")
+        assert not folders[-1].exists(), "传完该把暂存目录删掉"
+        print("[ok] 用例4b /传相册 1 按编号选中第一个相册并整批上传，传完清掉暂存")
 
         ev4c = make_event("1")
         await rt.dispatch("传相册 1", ev4c)
@@ -666,17 +664,9 @@ async def main():
         ev16 = make_event("")
         await rt.dispatch("群相册列表", ev16)
         assert any("微博原图" in s and "0_aaaaaaaa" in s for s in ev16.sent), ev16.sent
-        batches = sorted(plugin.root.glob("*"), key=lambda p: p.name)
-        assert len(batches) >= 2, [b.name for b in batches]
-        for b in batches:
-            imgs = list(b.glob("*"))
-            assert len(imgs) >= 2, f"批次目录 {b.name} 里只有 {len(imgs)} 个文件"
-            assert all(f.stat().st_size > 0 for f in imgs)
-        print(
-            "[ok] 用例13 预览/相册列表正常，",
-            len(batches),
-            "个本地批次目录都留着（传完不删）",
-        )
+        batches = list(plugin.root.glob("*"))
+        assert not batches, f"暂存目录没清干净: {[b.name for b in batches][:3]}"
+        print("[ok] 用例13 预览/相册列表正常，本地暂存一批没剩（传完即删）")
 
         await plugin.terminate()
         print("\n全部用例通过")

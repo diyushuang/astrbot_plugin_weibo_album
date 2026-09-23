@@ -31,6 +31,7 @@ from .napcat_album import (
 from .weibo_client import ANY_URL_RE, Image, WeiboClient, WeiboError
 
 PREFETCH = 5  # 下载并发度：整批先落到本地，之后才传相册
+UPLOAD_CONC = 3  # 同时在传的张数。 NapCat 每张图内部要串行发几十个 16KB 分片，串行太慢
 PENDING_TTL = 1800  # 下载完等 /传相册 选相册的存活时间
 MAX_ALBUM_CHOICES = 15  # 选择列表一次最多列几个相册
 _BAD_NAME = re.compile(r'[\\/:*?"<>|\s]+')
@@ -93,7 +94,7 @@ class WeiboAlbumPlugin(Star):
 
     async def initialize(self):
         self.root.mkdir(parents=True, exist_ok=True)
-        self._drop_old()
+        self._wipe_leftovers()
         await self._get_session()
 
     async def terminate(self):
@@ -102,16 +103,17 @@ class WeiboAlbumPlugin(Star):
             await self._session.close()
         self._session = None
 
-    def _drop_old(self):
-        """本地批次目录是有意保留的（方便人工筛选和重传），只按天数回收旧批次。"""
-        days = self._num("keep_days", 7)
-        if days <= 0:
-            return
-        cutoff = time.time() - days * 86400
+    def _wipe_leftovers(self):
+        """本地只是暂存：上传完就删，进程重启时把上次没传完的批次一并清掉。
+
+        待上传批次只存在内存里，重启后没人能再引用这些文件，留着就是纯垃圾。
+        """
         for d in self.root.glob("*"):
             try:
-                if d.is_dir() and d.stat().st_mtime < cutoff:
+                if d.is_dir():
                     shutil.rmtree(d)
+                else:
+                    d.unlink()
             except OSError:
                 pass
 
@@ -241,6 +243,9 @@ class WeiboAlbumPlugin(Star):
     async def _push(self, event: AstrMessageEvent, gid: str, want: str) -> None:
         job = self._pending.get(gid)
         if not job or time.time() - job["ts"] > PENDING_TTL:
+            if job and job["files"]:
+                # 过了期的暂存批次没人能再引用，留在本地就是垃圾
+                shutil.rmtree(job["files"][0][1].parent, ignore_errors=True)
             self._pending.pop(gid, None)
             await self._reply(event, "没有待上传的图了，先 /微博相册 <链接> 抓一批")
             return
@@ -280,6 +285,10 @@ class WeiboAlbumPlugin(Star):
 
             nc = await self._album_client(event)
             await self._reply(event, f"抓到 {len(images)} 张原图{note}，先整批存到本地…")
+            old = self._pending.pop(gid, None)
+            if old and old["files"]:
+                # 一批只留一份：上次没选相册就放下的那批已经作废了
+                shutil.rmtree(old["files"][0][1].parent, ignore_errors=True)
             folder = self._job_dir(posts)
             files, fails = await self._download_all(wb, images, folder)
             if not files:
@@ -380,7 +389,9 @@ class WeiboAlbumPlugin(Star):
         prefix: str = "",
     ) -> None:
         album_id, album_name = album
-        folder = files[0][1].parent.name
+        folder = files[0][1].parent
+        conc = max(1, self._num("upload_concurrency", UPLOAD_CONC))
+        interval = self._num("upload_interval", 0.5, float)
         existing = ""
         if self.config.get("skip_exists", True):
             existing = await self._existing_names(nc, gid, album_id)
@@ -392,23 +403,46 @@ class WeiboAlbumPlugin(Star):
                 f"相册「{album_name}」里已经有这 {len(files)} 张图了，无需重复上传",
             )
             return
-        start = f"开始上传 {len(todo)} 张到相册「{album_name}」"
+        start = f"开始上传 {len(todo)} 张到相册「{album_name}」（{conc} 张并发）"
         if dup:
             start += f"（另有 {dup} 张相册里已有，跳过）"
         await self._reply(event, f"{prefix}\n{start}" if prefix else start)
 
         before = await self._media_count(nc, gid, album_id)
         ok, fails, modes = 0, [], Counter()
-        interval = self._num("upload_interval", 1.5, float)
+        sem = asyncio.Semaphore(conc)
+
+        async def push(im: Image, path: Path):
+            async with sem:
+                try:
+                    mode = await nc.upload_file(gid, album_id, album_name, path)
+                except (NapCatError, OSError) as e:
+                    # 失败的那张留在本地，/传相册 可以直接重传，不用重新抓
+                    self.logger.warning(f"[weibo_album] 上传失败 {im.url}: {e}")
+                    return None, f"{_mark(im)}：{e}"
+                # 本地只是暂存：传成功就删，别让原图堆在 data 目录里
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return mode, ""
+
+        tasks = []
         for im, path in todo:
-            try:
-                modes[await nc.upload_file(gid, album_id, album_name, path)] += 1
-                ok += 1
-            except (NapCatError, OSError) as e:
-                fails.append(f"{_mark(im)}：{e}")
-                self.logger.warning(f"[weibo_album] 上传失败 {im.url}: {e}")
+            tasks.append(asyncio.create_task(push(im, path)))
             if interval:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(interval)  # 错开起点，别同时掐尖
+        for mode, err in await asyncio.gather(*tasks):
+            if mode:
+                modes[mode] += 1
+                ok += 1
+            else:
+                fails.append(err)
+        try:
+            if not any(folder.iterdir()):
+                folder.rmdir()  # 全传完了，空批次目录也别留
+        except OSError:
+            pass
         if ok:
             self._pending.pop(gid, None)
 
@@ -419,11 +453,13 @@ class WeiboAlbumPlugin(Star):
             msg += f"，相册新增 {gained} 张"
         if modes:
             msg += f"（{modes.most_common(1)[0][0]} 方式）"
-        msg += f"，本地 {folder}/ 已保留"
         if fails:
             msg += "\n失败明细：\n" + "\n".join(fails[:5])
             if len(fails) > 5:
                 msg += f"\n…另有 {len(fails) - 5} 张失败"
+            msg += f"\n失败的仍留在 {folder.name}/，可直接 /传相册 重传"
+        else:
+            msg += "，本地暂存已清理"
         await self._reply(event, msg)
 
     async def _media_count(self, nc: NapCatAlbum, gid: str, album_id: str) -> int:

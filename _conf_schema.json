@@ -26,24 +26,24 @@
     "default": 3,
     "hint": "容器接口风控比单条微博严，调大容易撞限流"
   },
+  "upload_concurrency": {
+    "description": "同时在上传相册的张数",
+    "type": "int",
+    "default": 3,
+    "hint": "NapCat 每张图都要串行发几十个 16KB 分片请求，串行传整批很慢；并发调大更快，QQ 侧开始报频繁就往下调，填 1 回到串行",
+    "obvious_hint": true
+  },
   "upload_interval": {
-    "description": "两张图之间的间隔秒数",
+    "description": "每两张图之间错开起点的秒数",
     "type": "float",
-    "default": 1.5,
-    "hint": "防 QQ 侧频控，上传失败多可调大到 3"
+    "default": 0.5,
+    "hint": "配合并发用：每隔这么多秒再放一张进队列。撞频控时调大到 1~2，填 0 表示一次性全部发起"
   },
   "skip_exists": {
     "description": "跳过相册里已有的图片",
     "type": "bool",
     "default": true,
     "hint": "按微博图片 pid 与相册内文件名比对，重复执行同一条微博不会传重"
-  },
-  "keep_days": {
-    "description": "本地批次目录保留天数",
-    "type": "int",
-    "default": 7,
-    "hint": "抓到的原图会留在 data/astrbot_plugin_weibo_album/albums/<批次>/ 里方便筛选和重传，超过这个天数才清理；填 0 表示永久保留",
-    "obvious_hint": true
   },
   "request_timeout": {
     "description": "微博请求超时（秒）",
