@@ -69,7 +69,9 @@ class FakeNapCat:
         self.flaky = 0  # >0 时上传先失败一次，触发频控重试
         self.reject_path = 0  # >0 时读不到本地文件，模拟 NapCat 与 AstrBot 不同机
         self.deny = 0  # >0 时上传直接给权限错误
-        self.no_has_more = False  # media_list 的声明里没有 has_more，要能靠 attach_info 翻页
+        self.no_has_more = (
+            False  # media_list 的声明里没有 has_more，要能靠 attach_info 翻页
+        )
 
     def uploads(self) -> list[dict]:
         return [p for a, p in self.seen if a == "upload_image_to_qun_album"]
@@ -99,9 +101,7 @@ class FakeNapCat:
             if not val.startswith("base64://") and self.reject_path > 0:
                 self.reject_path -= 1
                 # NapCat 的 checkUriType 认不出跨机路径 -> Unknown -> path='' -> readFileSync 抛这个
-                raise ActionFailed(
-                    1400, "ENOENT: no such file or directory, open ''"
-                )
+                raise ActionFailed(1400, "ENOENT: no such file or directory, open ''")
             if self.deny > 0:
                 self.deny -= 1
                 raise ActionFailed(1400, "该成员没有上传相册的权限")
@@ -174,9 +174,7 @@ async def main():
         assert fake.uploads()[-1]["file"] == str(big.resolve()), fake.uploads()[-1][
             "file"
         ]
-        print(
-            f"[ok] upload_file 首选本地路径方式（{fake.sizes[-1] // 1024}KB）"
-        )
+        print(f"[ok] upload_file 首选本地路径方式（{fake.sizes[-1] // 1024}KB）")
 
         small = tmp / "微博原图_bbbbbbbbbb.jpg"
         small.write_bytes(os.urandom(4096))
@@ -237,7 +235,9 @@ async def main():
 
         media = await nc.list_media("123456", aid)
         assert len(media) == 7, len(media)
-        print("[ok] list_media 用 attach_info 翻页取回", len(media), "条（不发送 count）")
+        print(
+            "[ok] list_media 用 attach_info 翻页取回", len(media), "条（不发送 count）"
+        )
 
         fake.no_has_more = True
         media = await nc.list_media("123456", aid)

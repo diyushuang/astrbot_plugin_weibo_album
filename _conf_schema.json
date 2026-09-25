@@ -45,6 +45,12 @@
     "default": true,
     "hint": "按微博图片 pid 与相册内文件名比对，重复执行同一条微博不会传重"
   },
+  "live_gif": {
+    "description": "live 图转 GIF 上传",
+    "type": "bool",
+    "default": true,
+    "hint": "微博 live 图（livephoto）会下载它的视频段用 ffmpeg 转成 GIF 再传进相册，相册里能看到动图；需要宿主机装有 ffmpeg（AstrBot 官方 Docker 镜像自带），没装或转换失败时自动回落上传封面静图。混在图里的真视频条目不传（群相册接口仅支持图片），回复里会注明数量"
+  },
   "same_host": {
     "description": "NapCat 与 AstrBot 在同一台机器",
     "type": "bool",

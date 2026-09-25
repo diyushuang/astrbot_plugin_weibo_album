@@ -87,7 +87,8 @@ def _has(msg: str, hints: tuple[str, ...]) -> bool:
 def pick(d: dict, keys: tuple[str, ...], default: str = "") -> str:
     for k in keys:
         v = d.get(k)
-        if v not in (None, "", 0):
+        # 只把 None / 空串当缺失：数值 0 是合法取值，吞掉会把 ID 为 0 的条目丢掉
+        if v is not None and v != "":
             return str(v)
     return default
 
@@ -238,11 +239,14 @@ class NapCatAlbum:
             return bool(page) and bool(nxt) and nxt != attach
         return bool(more) and nxt != attach
 
-    async def resolve_album(self, group_id: str, want: str) -> tuple[str, str]:
+    async def resolve_album(
+        self, group_id: str, want: str, default_name: str = ""
+    ) -> tuple[str, str]:
         """把用户给的相册名/ID 解析成 (album_id, album_name)。
 
         album_name 是要发给 QQ 的 sAlbumName，不是展示用的摆设，所以即使用户直接给了
-        ID 也要回查真实名字，不能拿 ID 顶替。
+        ID 也要回查真实名字，不能拿 ID 顶替。default_name 只在列表拉不到、ID 直通时
+        兜底展示名（比如绑定记录里存过的那个），避免把 ID 当名字发给 QQ。
         """
         want = (want or "").strip()
         if not want:
@@ -252,7 +256,7 @@ class NapCatAlbum:
             albums = await self.list_albums(group_id)
         except NapCatError:
             if looks_like_id:  # 列不出来时至少让 ID 直通，交给协议端裁决
-                return want, want
+                return want, default_name or want
             raise
         for a in albums:
             if pick(a, ALBUM_LIST_ITEM_ID_KEYS) == want:
@@ -307,20 +311,22 @@ class NapCatAlbum:
         for mode in list(self.modes):
             if mode == "path":
                 try:
-                    if path.stat().st_size == 0:
+                    if (await asyncio.to_thread(path.stat)).st_size == 0:
                         raise NapCatError("图片数据为空")
                 except OSError as e:
                     raise NapCatError(f"读取待上传图片失败 {path.name}: {e}") from e
-                file = str(path.resolve())
+                file = str(await asyncio.to_thread(path.resolve))
             else:
                 if raw is None:
                     try:
-                        raw = path.read_bytes()
+                        # 30MB 的原图读进来再编码都是重活，别卡住事件循环
+                        raw = await asyncio.to_thread(path.read_bytes)
                     except OSError as e:
                         raise NapCatError(f"读取待上传图片失败 {path.name}: {e}") from e
                     if not raw:
                         raise NapCatError("图片数据为空")
-                file = "base64://" + base64.b64encode(raw).decode("ascii")
+                raw_b64 = await asyncio.to_thread(base64.b64encode, raw)
+                file = "base64://" + raw_b64.decode("ascii")
             try:
                 await self.call(
                     "upload_image_to_qun_album",

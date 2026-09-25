@@ -17,9 +17,11 @@ ignore = [
   "E501",     # 与 AstrBot 上游一致：不卡行宽（中文注释行很容易超）
   "F403",
   "F405",
-  "ASYNC230",
-  "ASYNC240",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试脚本：sys.path 操作后的本地导入、async 测试主体里的少量同步 open
+"tests/*" = ["E402", "ASYNC230"]
 
 [tool.ruff.format]
 quote-style = "double"

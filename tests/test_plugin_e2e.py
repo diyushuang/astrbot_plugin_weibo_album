@@ -21,6 +21,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import types
 import uuid
 from pathlib import Path
@@ -28,10 +29,33 @@ from pathlib import Path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DIR_NAME = "astrbot_plugin_weibo_album"
 WEIBO_LINK = "https://m.weibo.cn/detail/4990000000000000"  # 单条 18 图
+# 混合媒体微博：多图 + live 图 + 结尾视频（用户真实遇到的帖子）
+WEIBO_MIXED_LINK = "https://weibo.com/1234567890/4991111111111111"
 WEIBO_MINI_TEXT = (
     "【微博】一起来看 https://m.weibo.cn/status/Ab1Cd2Ef3 打开微博小程序查看"
 )
 N_PICS = 18
+
+# QQ 里分享微博生成的小程序卡片：本体是消息里的 json 段，字段没有公开文档，
+# 这里按真实卡片的结构给一份（icon 是图床链接、url 是微博页、qqdocurl 是中转）
+WEIBO_CARD_JSON = json.dumps(
+    {
+        "config": {"appid": 100951776, "type": "normal"},
+        "extra": {"app_type": 1, "appid": 100951776, "uin": 10001},
+        "meta": {
+            "detail_1": {
+                "appid": 100951776,
+                "desc": "一起来看",
+                "icon": "https://wx2.sinaimg.cn/crop.0.0.120.120.120/abc.jpg",
+                "qqdocurl": "https://workflow.op.weibo.com/?uv=Ab1Cd2Ef3",
+                "title": "#小程序://微博/Ab1Cd2Ef3",
+                "url": "https://m.weibo.cn/status/Ab1Cd2Ef3",
+            }
+        },
+        "prompt": "[小程序]微博",
+    },
+    ensure_ascii=False,
+)
 
 # install_fake_astrbot() 造的那个假 AiocqhttpMessageEvent，以及挂在 AstrBot 那条
 # OneBot 连接对面的假 NapCat；main() 开头填好，make_event 默认按"来自 aiocqhttp 平台"造事件。
@@ -42,6 +66,24 @@ EVENT_PLUGIN = None
 
 class GreedyStr(str):
     """port of astrbot.core.star.filter.command.GreedyStr"""
+
+
+class Reply:
+    """port of astrbot.core.message.components.Reply（只取用到的 id/chain 字段）"""
+
+    def __init__(self, id="", **kw):
+        self.id = id
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class Json:
+    """port of astrbot.core.message.components.Json：data 收 str 会解析成 dict"""
+
+    def __init__(self, data):
+        if isinstance(data, str):
+            data = json.loads(data)
+        self.data = data
 
 
 class Plain:
@@ -194,6 +236,13 @@ def install_fake_astrbot():
     cmod = mod("astrbot.core.star.filter.command")
     cmod.GreedyStr = GreedyStr
 
+    # main.py 从 astrbot.api.message_components 拿组件：引用链里的 Json/Plain
+    # 按真实 api 出口的同名类提供
+    mcmod = mod("astrbot.api.message_components")
+    mcmod.Reply = Reply
+    mcmod.Json = Json
+    mcmod.Plain = Plain
+
     return flt, Star, AiocqhttpMessageEvent, registered
 
 
@@ -276,8 +325,14 @@ class FakeCommandRouter:
         raise AssertionError(f"没有指令匹配到 {message_str!r}")
 
 
-def make_event(text, group_id="123456", admin=True, napcat=True):
-    """napcat=False 造一条"来自别的平台"的消息：既不是 AiocqhttpMessageEvent 也没有 bot。"""
+def make_event(
+    text, group_id="123456", admin=True, napcat=True, quote=None, reply_chain=None
+):
+    """napcat=False 造一条"来自别的平台"的消息：既不是 AiocqhttpMessageEvent 也没有 bot。
+
+    quote 传被引用消息的 message_id：裸 Reply（chain 为空），插件走 get_msg 兜底；
+    reply_chain 传被引用消息的组件列表，模拟 AstrBot 适配器已经回取好的主路径。
+    """
     base = EVENT_BASE if napcat else object
     bot = EVENT_BOT if napcat else None
 
@@ -287,7 +342,21 @@ def make_event(text, group_id="123456", admin=True, napcat=True):
             self.sent = []
             self.stopped = False
             self.is_admin_flag = admin
-            self.message_obj = types.SimpleNamespace(self_id=10001 if bot else None)
+            if quote:
+                self.message_obj = types.SimpleNamespace(
+                    self_id=10001 if bot else None,
+                    message=[Reply(id=quote)],
+                )
+            elif reply_chain:
+                self.message_obj = types.SimpleNamespace(
+                    self_id=10001 if bot else None,
+                    message=[Reply(id="801", chain=list(reply_chain))],
+                )
+            else:
+                self.message_obj = types.SimpleNamespace(
+                    self_id=10001 if bot else None,
+                    message=[],
+                )
             self.bot = bot
 
         def get_group_id(self):
@@ -349,11 +418,12 @@ CONFIG = {
 }
 
 
-def cache_network(module):
+def cache_network(module, store):
     """同一次运行内缓存微博抓取结果。
 
     这份用例有 9 个上传环节，全部真下载会跑到 160+ 次请求，既慢又容易撞微博限流；
-    缓存只作用于单次进程，第一次仍然是真实网络。
+    缓存只作用于单次进程，第一次仍然是真实网络。store["fail_downloads"] 可以注入
+    "下载整批失败"，用来验证失败时旧暂存批次不被销毁。
     """
     posts_cache: dict[tuple, list] = {}
     bytes_cache: dict[str, bytes] = {}
@@ -366,6 +436,9 @@ def cache_network(module):
         return posts_cache[key]
 
     async def download(self, img, max_bytes=30 * 1024 * 1024):
+        if store.get("fail_downloads", 0) > 0:
+            store["fail_downloads"] -= 1
+            raise module.WeiboError("测试注入：下载失败")
         if img.url not in bytes_cache:
             bytes_cache[img.url] = await orig_dl(self, img, max_bytes=max_bytes)
         return bytes_cache[img.url]
@@ -408,12 +481,25 @@ class FakeNapCat:
     async def call_action(self, action, **params):
         store = self.store
         store["calls"].append((action, params))
-        if action == "get_qun_album_list":
+        if action == "get_msg":
+            # 回取被引用消息：卡片内容按 NapCat 的真实形态装在 json 段里
+            mid = str(params.get("message_id") or "")
+            payload = store.get("quoted", {}).get(mid)
+            if payload is None:
+                raise ActionFailed(1200, "message not found")
             return {
-                "album_list": [
-                    {"album_id": "0_aaaaaaaa", "name": "微博原图"},
-                    {"album_id": "0_bbbbbbbb", "name": "其他相册"},
-                ],
+                "message_id": mid,
+                "message": payload.get("segments", []),
+                "raw_message": payload.get("raw", ""),
+                "sender": {"user_id": "88888", "nickname": "分享者"},
+            }
+        if action == "get_qun_album_list":
+            names = store.get("album_names") or {
+                "0_aaaaaaaa": "微博原图",
+                "0_bbbbbbbb": "其他相册",
+            }
+            return {
+                "album_list": [{"album_id": k, "name": v} for k, v in names.items()],
                 "has_more": False,
             }
         if action == "get_group_album_media_list":
@@ -422,6 +508,9 @@ class FakeNapCat:
                 "has_more": False,
             }
         if action == "upload_image_to_qun_album":
+            if store.get("hang_uploads"):
+                # 挂住不回：等 terminate 把在飞任务撤掉
+                await asyncio.Event().wait()
             if store.get("fail_uploads", 0) > 0:
                 # 业务/权限类错误：不该触发载荷降级，也不该重试，就是这张传不上
                 store["fail_uploads"] -= 1
@@ -454,6 +543,11 @@ def reset_store(store):
     store["media"] = []
     store["calls"] = []
     store["fail_uploads"] = 0
+    store["fail_downloads"] = 0
+    store["reject_path"] = 0
+    store["hang_uploads"] = False
+    store["album_names"] = None
+    store["quoted"] = {}
     if EVENT_PLUGIN is not None:
         for k in [k for k in EVENT_PLUGIN._kv if k.startswith("sent:")]:
             EVENT_PLUGIN._kv[k] = {}
@@ -468,7 +562,7 @@ async def main():
     EVENT_BOT = types.SimpleNamespace(call_action=FakeNapCat(store).call_action)
 
     module, tmp = import_plugin()
-    cache_network(module)
+    cache_network(module, store)
     plugin = None
     try:
         assert issubclass(module.WeiboAlbumPlugin, Star), "插件类必须继承 Star"
@@ -486,7 +580,9 @@ async def main():
         # 开着它部署到分容器的机器上，每张图都会在 NapCat 控制台撞一条 ENOENT。
         with open(os.path.join(ROOT, "_conf_schema.json"), encoding="utf-8") as f:
             schema = json.load(f)
-        assert schema["same_host"]["default"] is False, "默认配置不该拿路径载荷去撞 ENOENT"
+        assert schema["same_host"]["default"] is False, (
+            "默认配置不该拿路径载荷去撞 ENOENT"
+        )
         assert set(CONFIG) <= set(schema), set(CONFIG) - set(schema)
         rt = FakeCommandRouter(
             plugin,
@@ -529,12 +625,16 @@ async def main():
             "uploads"
         ][0]
         assert all(isinstance(u["group_id"], str) for u in store["uploads"])
-        assert all(
-            p.get("self_id") == 10001 for _, p in store["calls"]
-        ), "走 AstrBot 连接时必须带 self_id 路由到对应的那个 NapCat"
+        assert all(p.get("self_id") == 10001 for _, p in store["calls"]), (
+            "走 AstrBot 连接时必须带 self_id 路由到对应的那个 NapCat"
+        )
         names_up = [Path(u["file"]).name for u in store["uploads"]]
         assert all(n.endswith((".jpg", ".png", ".gif")) for n in names_up), names_up[:3]
-        assert "本地暂存已清理" in ev.sent[-1], ev.sent[-1]
+        assert "上传完成：成功 18/18 张" in ev.sent[-1], ev.sent[-1]
+        assert "base64" not in ev.sent[-1] and "本地暂存" not in ev.sent[-1], (
+            ev.sent[-1],
+            "完成回复只报状态和张数，不带载荷方式/清理提示这些实现细节",
+        )
         assert len(ev.sent) == 2, (
             f"一步到位整批只该有两条群消息（开始提示 + 完成汇总），实际 {len(ev.sent)} 条"
         )
@@ -554,7 +654,9 @@ async def main():
         assert len(store["uploads"]) == before, (
             f"去重没生效，又多传了 {len(store['uploads']) - before} 张"
         )
-        assert any("之前已经传进" in s and "无需重复上传" in s for s in ev2.sent), ev2.sent
+        assert any("之前已经传进" in s and "无需重复上传" in s for s in ev2.sent), (
+            ev2.sent
+        )
         assert not list(plugin.root.glob("*")), (
             "整批都已传过时，刚下载的临时文件该当场清掉，不能占着 temp"
         )
@@ -639,7 +741,11 @@ async def main():
         )
         ev6 = make_event("其他相册")
         await rt.dispatch("绑定相册 其他相册", ev6)
-        assert await plugin.get_kv_data("album:123456", "") == "其他相册", ev6.sent
+        bound = await plugin.get_kv_data("album:123456", "")
+        assert bound == {"id": "0_bbbbbbbb", "name": "其他相册"}, (
+            bound,
+            "绑定现在要存 ID+名字，QQ 侧改名后仍能按 ID 命中",
+        )
         await rt.dispatch(f"微博相册 {WEIBO_LINK}", make_event(WEIBO_LINK))
         ev6b = make_event("")
         await rt.dispatch("传相册", ev6b)
@@ -688,7 +794,9 @@ async def main():
         ev9 = make_event(WEIBO_LINK, napcat=False)
         await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev9)
         assert any("aiocqhttp" in s for s in ev9.sent), ev9.sent
-        assert not store["uploads"] and not store["calls"], "拿不到连接时不该发出任何调用"
+        assert not store["uploads"] and not store["calls"], (
+            "拿不到连接时不该发出任何调用"
+        )
         assert not any("填" in s or "HTTP API" in s for s in ev9.sent), (
             "不该再把用户推去自己填 NapCat 地址:" + " / ".join(ev9.sent)
         )
@@ -757,7 +865,9 @@ async def main():
         assert len(store["uploads"]) == N_PICS, ev17.sent[-1]
         assert {u["_mode"] for u in store["uploads"]} == {"base64"}
         probes = 999 - store["reject_path"]
-        assert probes == 1, f"整批撞了 {probes} 次路径载荷，NapCat 侧会刷同样多条 ENOENT"
+        assert probes == 1, (
+            f"整批撞了 {probes} 次路径载荷，NapCat 侧会刷同样多条 ENOENT"
+        )
         assert plugin.payload == "base64", plugin.payload
         print("[ok] 用例14a 同机开关开错时只有第一张探测路径载荷，同批其余直接 base64")
 
@@ -774,9 +884,9 @@ async def main():
         print("[ok] 用例14b 学到的载荷方式跨批次保留，NapCat 侧零条 ENOENT")
 
         # base64 载荷会被 NapCat 改名成 randomUUID，相册文件名里没有 pid —— 只能靠记录去重
-        assert all(re.match(r"^[0-9a-f]{32}\.jpg$", n) for n in store["media"]), (
-            store["media"][:2]
-        )
+        assert all(re.match(r"^[0-9a-f]{32}\.jpg$", n) for n in store["media"]), store[
+            "media"
+        ][:2]
         before18 = len(store["uploads"])
         ev18 = make_event(WEIBO_LINK)
         await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev18)
@@ -796,7 +906,9 @@ async def main():
         await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev19)
         assert len(store["uploads"]) == N_PICS, ev19.sent[-1]
         assert all(u["file"].startswith("base64://") for u in store["uploads"])
-        assert store["reject_path"] == 999, "一条路径载荷都不该发出去，NapCat 侧零条 ENOENT"
+        assert store["reject_path"] == 999, (
+            "一条路径载荷都不该发出去，NapCat 侧零条 ENOENT"
+        )
         assert plugin.payload == "path", "关掉同机开关后不该改写那条载荷记忆"
         print("[ok] 用例15 默认配置只发 base64 载荷，NapCat 控制台零条 ENOENT")
 
@@ -827,8 +939,234 @@ async def main():
         )
         assert "成功 3/" in ev21.sent[-1], ev21.sent[-1]
         assert not list(plugin.root.glob("*")), "补传完成，暂存目录该清掉"
+        print("[ok] 用例16 一步到位失败 3 张后 /传相册 只补传那 3 张，闭环后暂存清空")
+
+        # ---- 用例 17：skip_exists=False 时部分失败，重传不能对已删的成功张报错
+        reset_store(store)
+        plugin.payload = "path"  # path 载荷下相册文件名才是 pid，台账才对得上
+        plugin.config["skip_exists"] = False
+        store["fail_uploads"] = 3
+        ev30 = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev30)
+        assert len(store["uploads"]) == N_PICS - 3, ev30.sent[-1:]
+        job = plugin._pending.get("123456")
+        assert job is not None and len(job["files"]) == 3, (
+            f"pending 里该只剩失败张（成功张已删盘要剔掉），实际 "
+            f"{len(job['files']) if job else None} 张"
+        )
+        store["fail_uploads"] = 0
+        ev31 = make_event("")
+        await rt.dispatch("传相册", ev31)
+        assert "成功 3/" in ev31.sent[-1], ev31.sent[-1]
+        assert not list(plugin.root.glob("*")), "补传完成，暂存该清掉"
+        plugin.config["skip_exists"] = True
+        print("[ok] 用例17 skip_exists=False 时重传闭环依然成立（pending 只留失败张）")
+
+        # ---- 用例 18：QQ 侧把相册改名后，绑定按 ID 仍命中；旧版纯名字绑定也兼容
+        reset_store(store)
+        await rt.dispatch("绑定相册 其他相册", make_event("其他相册"))
+        store["album_names"] = {"0_aaaaaaaa": "微博原图", "0_bbbbbbbb": "改名后的相册"}
+        await rt.dispatch(f"微博相册 {WEIBO_LINK}", make_event(WEIBO_LINK))
+        ev32 = make_event("")
+        await rt.dispatch("传相册", ev32)
+        assert all(u["album_id"] == "0_bbbbbbbb" for u in store["uploads"]), ev32.sent[
+            -1:
+        ]
+        assert all(u["album_name"] == "改名后的相册" for u in store["uploads"])
+        store["album_names"] = None
+        reset_store(store)  # 分开两段，上传记录才不会互相污染
+        plugin._kv["album:123456"] = "微博原图"  # 旧版本存的就是个名字字符串
+        await rt.dispatch(f"微博相册 {WEIBO_LINK}", make_event(WEIBO_LINK))
+        ev33 = make_event("")
+        await rt.dispatch("传相册", ev33)
+        assert all(u["album_id"] == "0_aaaaaaaa" for u in store["uploads"]), ev33.sent[
+            -1:
+        ]
+        print("[ok] 用例18 相册改名后绑定按 ID 仍命中；旧版纯名字绑定也兼容")
+
+        # ---- 用例 19：过 TTL 的暂存批次连文件带登记一起清（含别的群的）
+        reset_store(store)
+        await rt.dispatch(f"微博相册 {WEIBO_MINI_TEXT}", make_event(WEIBO_MINI_TEXT))
+        job = plugin._pending.get("123456")
+        assert job is not None, "先抓一批放着"
+        job["ts"] -= module.PENDING_TTL + 1
+        expired_dir = job["files"][0][1].parent
+        junk = plugin.root / "999_junk"
+        junk.mkdir(parents=True, exist_ok=True)
+        plugin._pending["999"] = {
+            "files": [(None, junk / "x.jpg")],
+            "albums": [],
+            "ts": time.time() - module.PENDING_TTL - 1,
+        }
+        ev34 = make_event("")
+        await rt.dispatch("传相册", ev34)
+        assert any("没有待上传" in s for s in ev34.sent), ev34.sent
+        assert not expired_dir.exists(), "本群过期批次目录该清掉"
+        assert not junk.exists() and "999" not in plugin._pending, (
+            "别的群的过期批次也要被顺手清掉"
+        )
+        print("[ok] 用例19 过 TTL 的暂存批次连文件带登记清掉（含别的群的）")
+
+        # ---- 用例 20：新一批全下载失败时，上一批还能 /传相册，不能先被销毁
+        reset_store(store)
+        await rt.dispatch(f"微博相册 {WEIBO_MINI_TEXT}", make_event(WEIBO_MINI_TEXT))
+        old_dir = plugin._pending["123456"]["files"][0][1].parent
+        store["fail_downloads"] = 999
+        ev35 = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev35)
+        store["fail_downloads"] = 0
+        assert any("一张都没下载下来" in s for s in ev35.sent), ev35.sent
+        assert old_dir.exists(), "新批次全失败时，旧的暂存批次不该先被销毁"
+        assert plugin._pending["123456"]["files"][0][1].parent == old_dir
+        ev36 = make_event("1")
+        await rt.dispatch("传相册 1", ev36)
+        assert len(store["uploads"]) == N_PICS, ev36.sent[-1:]
+        print("[ok] 用例20 新一批全下载失败时旧暂存批次完好，仍可 /传相册")
+
+        # ---- 用例 21：max_images 配成 0 也至少传 1 张
+        reset_store(store)
+        plugin.config["max_images"] = 0
+        ev37 = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev37)
+        assert len(store["uploads"]) == 1, ev37.sent[-1:]
+        plugin.config["max_images"] = 30
+        print("[ok] 用例21 max_images=0 兜底成至少 1 张，不再误导'0 张都没下来'")
+
+        # ---- 用例 22：非法配置按默认兜底；热改 cookie/超时/代理不重载插件也生效
+        plugin.config["request_timeout"] = "not-a-number"
+        wb1 = await plugin._weibo()
+        assert wb1.timeout == 25, wb1.timeout
+        plugin.config["proxy"] = "http://127.0.0.1:7890"
+        wb2 = await plugin._weibo()
+        assert wb2 is not wb1 and wb2.proxy == "http://127.0.0.1:7890"
+        assert await plugin._weibo() is wb2, "配置没变时不该重建客户端"
+        plugin.config["proxy"] = ""
+        plugin.config["request_timeout"] = 25
+        print("[ok] 用例22 非法配置按默认兜底；热改代理立即重建客户端")
+
+        # ---- 用例 23：台账超上限时挤掉最老的记录
+        reset_store(store)
+        await plugin._remember(
+            "123456", "0_aaaaaaaa", [f"m{i:04d}" for i in range(module.LEDGER_MAX)]
+        )
+        await plugin._remember("123456", "0_aaaaaaaa", ["newest"])
+        ledger = await plugin.get_kv_data(
+            plugin._ledger_key("123456", "0_aaaaaaaa"), {}
+        )
+        assert len(ledger) == module.LEDGER_MAX, len(ledger)
+        assert "newest" in ledger and "m0000" not in ledger, "最老的记录该被挤掉"
+        print("[ok] 用例23 台账超上限时淘汰最老记录")
+
+        # ---- 用例 24：引用微博小程序卡片发指令，不用粘链接也能抓取上传
+        # 主路径：AstrBot 适配器收到引用消息时已调过 get_msg，把被引用消息的组件
+        # （卡片 = Json 组件，data 是 dict）放进 Reply.chain，插件直接读
+        reset_store(store)
+        ev_pq = make_event("", reply_chain=[Json(WEIBO_CARD_JSON)])
+        await rt.dispatch("微博图片", ev_pq)
+        assert any(f"{N_PICS} 张" in s for s in ev_pq.sent), ev_pq.sent
+        ev_q = make_event("", reply_chain=[Json(WEIBO_CARD_JSON)])
+        await rt.dispatch("微博相册", ev_q)
+        assert any("/传相册" in s for s in ev_q.sent), ev_q.sent
+        assert plugin._pending.get("123456"), "引用发起的批次也要登记待上传"
+        ev_q2 = make_event("")
+        await rt.dispatch("传相册 1", ev_q2)
+        assert len(store["uploads"]) == N_PICS, ev_q2.sent[-1:]
+        assert all(u["album_id"] == "0_aaaaaaaa" for u in store["uploads"])
+        # 回复时 QQ 常自动带被引用者的 @ 段，"@昵称(uin)" 混进命令参数也
+        # 不能挡住引用解析（这就是上一版失败的原因）
+        ev_at = make_event(
+            "微博相册 @某人(123456)", reply_chain=[Json(WEIBO_CARD_JSON)]
+        )
+        await rt.dispatch("微博相册 @某人(123456)", ev_at)
+        assert any("/传相册" in s for s in ev_at.sent), ev_at.sent
         print(
-            "[ok] 用例16 一步到位失败 3 张后 /传相册 只补传那 3 张，闭环后暂存清空"
+            "[ok] 用例24 引用小程序卡片（Reply.chain 主路径）：预览/抓取列相册/上传，"
+            "回复带 @ 段也不挡"
+        )
+
+        # ---- 用例 25：引用 + 相册名一步到位。参数不是链接就是相册名，
+        # 与 "/微博相册 <链接> <相册名>" 的写法对齐，两种写法都不再列相册
+        reset_store(store)
+        ev_t = make_event("微博相册 | 微博原图", reply_chain=[Plain(WEIBO_MINI_TEXT)])
+        await rt.dispatch("微博相册 | 微博原图", ev_t)
+        assert len(store["uploads"]) == N_PICS, ev_t.sent[-1:]
+        assert all(u["album_id"] == "0_aaaaaaaa" for u in store["uploads"])
+        reset_store(store)
+        ev_t2 = make_event("微博相册 微博原图", reply_chain=[Json(WEIBO_CARD_JSON)])
+        await rt.dispatch("微博相册 微博原图", ev_t2)
+        assert len(store["uploads"]) == N_PICS, ev_t2.sent[-1:]
+        assert all(u["album_id"] == "0_aaaaaaaa" for u in store["uploads"])
+        assert not any("传到哪个相册" in s for s in ev_t2.sent), (
+            f"给了相册名就不该再列选择: {ev_t2.sent}"
+        )
+        print("[ok] 用例25 引用 + 相册名一步到位（| 与直写两种写法）直达指定相册")
+
+        # ---- 用例 26：引用的异常路径都要有可操作提示
+        store["quoted"]["803"] = {
+            "raw": "今天天气不错",
+            "segments": [{"type": "text", "data": {"text": "今天天气不错"}}],
+        }
+        ev_x = make_event("", reply_chain=[Plain("今天天气不错")])
+        await rt.dispatch("微博相册", ev_x)
+        assert any("被引用的消息里没有识别到" in s for s in ev_x.sent), ev_x.sent
+        # 裸 Reply（适配器没回取成功）：插件自己走 get_msg 兜底
+        store["quoted"]["801"] = {
+            "raw": "[小程序]微博",
+            "segments": [{"type": "json", "data": {"data": WEIBO_CARD_JSON}}],
+        }
+        ev_bare = make_event("", quote="801")
+        await rt.dispatch("微博相册", ev_bare)
+        assert any("/传相册" in s for s in ev_bare.sent), ev_bare.sent
+        assert len(store["uploads"]) == N_PICS, ev_bare.sent[-1:]
+        ev_y = make_event("", quote="999")  # 引用的消息已经撤回/过期
+        await rt.dispatch("微博相册", ev_y)
+        assert any("取不到被引用" in s for s in ev_y.sent), ev_y.sent
+        ev_z = make_event("", napcat=False, quote="801")
+        await rt.dispatch("微博相册", ev_z)
+        assert any("NapCat" in s for s in ev_z.sent), ev_z.sent
+        print(
+            "[ok] 用例26 引用异常路径：无关消息/裸 Reply 走 get_msg 兜底/"
+            "引用已失效/非 NapCat 平台都给提示"
+        )
+
+        # ---- 用例 27：terminate 撤掉在飞的上传任务，热重载不留半截批次悬案
+        reset_store(store)
+        plugin.payload = "path"
+        store["hang_uploads"] = True
+        hang_task = asyncio.create_task(
+            rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", make_event(WEIBO_LINK))
+        )
+        await asyncio.sleep(0.8)  # 等上传环节真的挂进假 NapCat
+        assert plugin._inflight, "此刻应该有在飞的上传任务"
+        await plugin.terminate()
+        await hang_task
+        assert not plugin._inflight and not plugin._pending, "在飞任务与登记都该撤干净"
+        store["hang_uploads"] = False
+        print("[ok] 用例27 terminate 撤掉在飞上传任务并清空待上传登记")
+
+        # ---- 用例 28：混合媒体微博（多图 + live 图 + 结尾视频）
+        reset_store(store)
+        plugin._wipe_leftovers()  # 用例 27 的半截批次由"重启清理"兜底，这里手动触发
+        plugin.payload = "base64"
+        ev41 = make_event(WEIBO_MIXED_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_MIXED_LINK} | 微博原图", ev41)
+        joined = "\n".join(ev41.sent)
+        # 视频条目不再被当封面图上传，回复里注明数量
+        assert "视频未上传" in joined, ev41.sent
+        # 上传闭环照常走完
+        assert any("上传完成" in s or "上传未完成" in s for s in ev41.sent), ev41.sent
+        n_uploaded = len(store["uploads"])
+        assert n_uploaded > 0, f"混合微博的图片一张都没传上: {ev41.sent}"
+        # 上传的载荷解码后都应该是图片（GIF/JPG/PNG），mp4 不会混进来
+        for u in store["uploads"]:
+            if u["file"].startswith("base64://"):
+                head = base64.b64decode(u["file"][9:])[:6]
+                assert head[:3] in (b"GIF", b"\xff\xd8\xff", b"\x89PNG"), head
+        assert not list(plugin.root.glob("*")), "混合批次传完也该清干净"
+        print(
+            f"[ok] 用例28 混合媒体微博：图片 {n_uploaded} 张上传成功，"
+            f"视频条目跳过并注明（live 图在本机"
+            f"{'走 GIF' if plugin._ffmpeg else '回落封面'}）"
         )
 
         await plugin.terminate()

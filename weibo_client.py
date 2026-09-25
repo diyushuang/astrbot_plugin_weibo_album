@@ -18,6 +18,32 @@ DESKTOP_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+# 重试与退避常量集中放这里：整条链路没有总超时，单请求最坏要打满
+# RETRY_TIMES 次尝试，每次还可能等一次访客引导，按部署环境酌情调
+RETRY_TIMES = 3  # 单请求最大尝试次数
+RETRY_BACKOFF = 0.8  # 网络异常退避步进（秒），按尝试次数递增
+RATE_BACKOFF = 0.6  # 403/418/432/429 风控退避步进
+BOOTSTRAP_WAIT = 15  # 等别的并发请求完成访客引导的上限
+MAX_REDIRECTS = 5  # 手动跟随重定向的上限
+
+# Cookie 只跟微博系域名出站：指令参数里的链接与小程序卡片是不可信输入，
+# 解析与 page 兜底可能把请求带去任意外域，访客/登录 Cookie 一个字节都不能带出去。
+WEIBO_HOST_SUFFIXES = (
+    "weibo.cn",
+    "weibo.com",
+    "weibo.com.cn",
+    "sina.cn",
+    "sina.com.cn",
+    "sinaimg.cn",
+    "sinajs.cn",
+)
+
+
+def _is_weibo_host(url: str) -> bool:
+    host = urllib.parse.urlparse(url).hostname or ""
+    return any(host == s or host.endswith("." + s) for s in WEIBO_HOST_SUFFIXES)
+
+
 STATUS_ID_RE = re.compile(r"[0-9A-Za-z]{8,20}")
 SINAIMG_RE = re.compile(
     r"(https?:)?//([a-z0-9]+)\.sinaimg\.cn/([a-z0-9]+)/([0-9a-zA-Z]+)\.(\w+)", re.I
@@ -34,6 +60,18 @@ ARTICLE_ID_KEYS = ("230940", "230653", "230612", "102284")
 # 公众号/图集容器页前缀（走 getIndex）
 CONTAINER_PAGE_KEYS = ("100160", "107603", "107803", "100808")
 
+# 「#小程序://微博/<bid>」分享口令
+MINI_BID_RE = re.compile(r"#小程序://微博/([0-9A-Za-z]{6,20})")
+# 可直接抓取的微博页面链接
+PAGE_LINK_RE = re.compile(
+    r"(?:m\.weibo\.cn/(?:status|detail|p)/|weibo\.com/\d{6,}/[0-9A-Za-z]|ttarticle|article/mix|containerid=)",
+    re.I,
+)
+# 要跟一次跳转才能落到微博页的中转链接（op.weibo.com 是微博在 QQ 侧的落地中转域）
+SHORT_LINK_RE = re.compile(r"t\.cn/|url\.cn/|op\.weibo\.com/", re.I)
+# QQ 小程序卡片里可能装着真实跳转地址的字段
+CARD_URL_KEYS = ("qqdocurl", "url", "jump_url")
+
 
 class WeiboError(Exception):
     pass
@@ -46,6 +84,8 @@ class Image:
     pid: str = ""
     ext: str = "jpg"
     animated: bool = False
+    kind: str = "pic"  # pic 普通图 / live livephoto / video 视频条目
+    video_url: str = ""  # live/video 条目的视频地址（videoSrc），普通图为空
 
     @property
     def key(self) -> str:
@@ -91,6 +131,81 @@ def _clean(s: str) -> str:
     return re.sub(r"&[a-z]+;", " ", s).strip()
 
 
+def _share_candidates(text: str) -> list[tuple[int, str]]:
+    """从一段纯文本里按优先级收集微博目标：0 页面直链 > 1 口令 bid > 2 中转短链。"""
+    found: list[tuple[int, str]] = []
+    for u in extract_urls(text or ""):
+        if PAGE_LINK_RE.search(u):
+            found.append((0, u))
+        elif SHORT_LINK_RE.search(u):
+            found.append((2, u))
+    m = MINI_BID_RE.search(text or "")
+    if m:
+        found.append((1, m.group(1)))
+    return found
+
+
+def _card_candidates(node, found: list[tuple[int, str]]) -> None:
+    """遍历小程序卡片 JSON 收集候选；qqdocurl 一类中转字段兜底记为最低优先级。
+
+    不能只认 title/prompt 这几个固定字段：QQ 卡片结构没有公开文档，微博改版
+    随时可能换壳，全字段扫一遍才扛得住。
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, str):
+                found.extend(_share_candidates(v))
+                if (
+                    k in CARD_URL_KEYS
+                    and v.startswith("http")
+                    and not (PAGE_LINK_RE.search(v) or SHORT_LINK_RE.search(v))
+                ):
+                    found.append((3, v))
+            else:
+                _card_candidates(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            _card_candidates(v, found)
+
+
+def target_from_share(*parts) -> str:
+    """从引用消息的各段（小程序卡片 dict / JSON 字符串 / 纯文本）里提取微博目标。
+
+    优先级：微博页面直链 > 「#小程序://微博/<bid>」口令 > 短链/中转链 >
+    卡片中转字段。AstrBot 的 Json 组件 .data 已是解析后的 dict，直接收。
+    """
+    found: list[tuple[int, str]] = []
+    for part in parts:
+        if isinstance(part, (dict, list)):
+            _card_candidates(part, found)
+            continue
+        if not isinstance(part, str) or not part.strip():
+            continue
+        try:
+            data = json.loads(part)
+        except Exception:
+            data = None
+        if isinstance(data, (dict, list)):
+            _card_candidates(data, found)
+        else:
+            found.extend(_share_candidates(part))
+    if not found:
+        return ""
+    return min(found, key=lambda t: t[0])[1]
+
+
+def has_share_target(text: str) -> bool:
+    """参数文本里是否已有可直接使用的微博目标（链接或裸 ID）。
+
+    QQ 回复消息会自动带上被引用者的 @ 段，"@昵称(uin)" 会被适配器拼进命令参数，
+    有它不等于有链接，不能因此跳过引用解析。
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    return bool(extract_urls(text)) or bool(STATUS_ID_RE.fullmatch(text))
+
+
 class WeiboClient:
     """免登录抓取客户端：自动完成微博访客 Cookie 引导，失败时用用户 Cookie 兜底。"""
 
@@ -116,7 +231,12 @@ class WeiboClient:
     # ---------- 基础请求 ----------
 
     def _headers(
-        self, referer: str, ajax: bool, desktop: bool, bucket: str = "com"
+        self,
+        referer: str,
+        ajax: bool,
+        desktop: bool,
+        bucket: str = "com",
+        with_cookies: bool = True,
     ) -> dict:
         h = {
             "User-Agent": DESKTOP_UA if desktop else MOBILE_UA,
@@ -130,9 +250,12 @@ class WeiboClient:
             h["Accept"] = "application/json, text/plain, */*"
             h["Origin"] = "https://m.weibo.cn"
             h["mweibo-pwa"] = "1"
-        ck = self.cookie or "; ".join(f"{k}={v}" for k, v in self._ck[bucket].items())
-        if ck:
-            h["Cookie"] = ck
+        if with_cookies:
+            ck = self.cookie or "; ".join(
+                f"{k}={v}" for k, v in self._ck[bucket].items()
+            )
+            if ck:
+                h["Cookie"] = ck
         return h
 
     @staticmethod
@@ -148,55 +271,90 @@ class WeiboClient:
         desktop: bool = False,
         allow_redirects: bool = True,
         max_bytes: int = 0,
+        in_bootstrap: bool = False,
     ):
         last = None
-        bucket = self._bucket_of(url)
-        for attempt in range(3):
-            try:
-                async with self.s.get(
-                    url,
-                    headers=self._headers(referer, ajax, desktop, bucket),
-                    timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    proxy=self.proxy,
-                    allow_redirects=allow_redirects,
-                ) as r:
-                    for morsel in r.cookies.values():
-                        if morsel.value and morsel.value != "deleted":
-                            self._ck[bucket][morsel.key] = morsel.value
-                    if max_bytes:
-                        # 原图动辄十几 MB，边下边判，超限就别把整张图读进内存了
-                        buf = bytearray()
-                        async for chunk in r.content.iter_chunked(64 * 1024):
-                            buf += chunk
-                            if len(buf) > max_bytes:
+        for attempt in range(RETRY_TIMES):
+            # 重定向手动逐跳跟随，不用 aiohttp 的自动跳转：自动跳转会原样转发
+            # 手工设置的 Cookie 头，跳到外站就带出去了。每一跳都重判域名单，
+            # 只有落点仍是微博系域名才带 Cookie。
+            current = url
+            hop = 0
+            while True:
+                bucket = self._bucket_of(current)
+                try:
+                    async with self.s.get(
+                        current,
+                        headers=self._headers(
+                            referer,
+                            ajax,
+                            desktop,
+                            bucket,
+                            with_cookies=_is_weibo_host(current),
+                        ),
+                        timeout=aiohttp.ClientTimeout(total=self.timeout),
+                        proxy=self.proxy,
+                        allow_redirects=False,
+                    ) as r:
+                        if allow_redirects and r.status in (301, 302, 303, 307, 308):
+                            loc = (r.headers.get("Location") or "").strip()
+                            if loc and hop < MAX_REDIRECTS:
+                                current = urllib.parse.urljoin(str(r.url), loc)
+                                hop += 1
+                                continue
+                            if loc:
                                 raise WeiboError(
-                                    f"图片超过 {max_bytes // 1048576}MB 上限，已中止下载"
+                                    f"重定向超过 {MAX_REDIRECTS} 次：{url}"
                                 )
-                        body = bytes(buf)
-                    else:
-                        body = await r.read()
-                    if r.status in (403, 418, 432, 429) and attempt < 2:
-                        last = (r.status, body)
-                        if self._bootstrapping:
-                            # 别的并发请求正在引导访客 Cookie：等它收场再重试，
-                            # 别把这次重试机会浪费在还没就绪的 Cookie 上
-                            try:
-                                await asyncio.wait_for(
-                                    self._bootstrap_evt.wait(), timeout=15
-                                )
-                            except asyncio.TimeoutError:
-                                pass
+                        for morsel in r.cookies.values():
+                            if morsel.value and morsel.value != "deleted":
+                                self._ck[bucket][morsel.key] = morsel.value
+                        if max_bytes:
+                            # 原图动辄十几 MB，边下边判，超限就别把整张图读进内存了
+                            buf = bytearray()
+                            async for chunk in r.content.iter_chunked(64 * 1024):
+                                buf += chunk
+                                if len(buf) > max_bytes:
+                                    raise WeiboError(
+                                        f"图片超过 {max_bytes // 1048576}MB 上限，已中止下载"
+                                    )
+                            body = bytes(buf)
                         else:
-                            await self.bootstrap_visitor(force=True)
-                        await asyncio.sleep(0.6 * (attempt + 1))
-                        continue
-                    return r.status, r.url, body
-            except WeiboError:
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                last = (0, str(e).encode())
-                if attempt < 2:
-                    await asyncio.sleep(0.8 * (attempt + 1))
+                            body = await r.read()
+                        if r.status in (403, 418, 432, 429) and attempt < 2:
+                            last = (r.status, body)
+                            if in_bootstrap:
+                                # 这场请求本身就是引导的一部分：等收场信号只会等到
+                                # 自己这场引导，递归引导更不行，直接退避后重试
+                                pass
+                            elif self._bootstrapping:
+                                # 别的并发请求正在引导访客 Cookie：等它收场再重试，
+                                # 别把这次重试机会浪费在还没就绪的 Cookie 上
+                                try:
+                                    await asyncio.wait_for(
+                                        self._bootstrap_evt.wait(),
+                                        timeout=BOOTSTRAP_WAIT,
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+                            else:
+                                await self.bootstrap_visitor(force=True)
+                            await asyncio.sleep(RATE_BACKOFF * (attempt + 1))
+                            break  # 用掉这次尝试，进下一轮
+                        return r.status, r.url, body
+                except WeiboError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last = (0, str(e).encode())
+                    if attempt < 2:
+                        await asyncio.sleep(RETRY_BACKOFF * (attempt + 1))
+                    break  # 进下一轮尝试
+        if last and not last[0]:
+            # 网络类异常把原文带上（截断），http 状态错误只报状态码——body 可能是
+            # 整页风控文案，带出来就是刷屏
+            raise WeiboError(
+                f"请求失败 {url}（{last[1].decode('utf-8', 'replace')[:120]}）"
+            )
         raise WeiboError(f"请求失败 {url} -> {last[0] if last else '?'}")
 
     async def get_json(
@@ -225,9 +383,10 @@ class WeiboClient:
         ok = False
         self._bootstrapping = True
         try:
-            st, _, body = await self._raw(
+            _, _, body = await self._raw(
                 "https://passport.weibo.com/visitor/genvisitor?cb=gen_callback&fp=%7B%7D",
                 referer="https://m.weibo.cn/",
+                in_bootstrap=True,
             )
             m = re.search(r'"tid":"([^"]+)"', body.decode("utf-8", "replace"))
             if not m:
@@ -246,7 +405,7 @@ class WeiboClient:
                     f"https://{host}/visitor/visitor?a=incarnate"
                     f"&t={tid}&w=2&c=095&gc=&cb=cross_domain&from=weibo{extra}&_rand={time.time()}"
                 )
-                st2, _, _ = await self._raw(u, referer=ref)
+                st2, _, _ = await self._raw(u, referer=ref, in_bootstrap=True)
                 ok = ok or st2 == 200
             ok = bool(self._ck["cn"] or self._ck["com"])
         except WeiboError:
@@ -280,7 +439,9 @@ class WeiboClient:
                 final_url = u
                 break
 
-        if re.search(r"t\.cn/|url\.cn/|weibo\.com/[^/\s]+/R[\w]{7,}$", final_url, re.I):
+        if SHORT_LINK_RE.search(final_url) or re.search(
+            r"weibo\.com/[^/\s]+/R[\w]{7,}$", final_url, re.I
+        ):
             try:
                 _, jumped, _ = await self._raw(final_url, allow_redirects=True)
                 if jumped:
@@ -340,6 +501,10 @@ class WeiboClient:
             return {"kind": "article", "id": m.group(1), "url": final_url}
         if m:
             return {"kind": "status", "id": m.group(1), "url": final_url}
+        # page 兜底只收微博系域名：消息里的链接是不可信输入，外站不该被机器人
+        # 请求（SSRF 面），带出去的 Cookie 也已经按域门控收死在 _raw 里
+        if not _is_weibo_host(final_url):
+            raise WeiboError(NO_LINK_HINT)
         return {"kind": "page", "id": "", "url": final_url}
 
     # ---------- 各类内容 -> Post ----------
@@ -446,16 +611,34 @@ class WeiboClient:
             if not base:
                 continue
             seg = base.split("?")[0].rstrip("/").split("/")
-            pid = p.get("pid") or (seg[-2] if len(seg) >= 2 else "")
+            # 接口缺 pid 时从 URL 提取：sinaimg 的路径是 /<尺寸token>/<pid>.<ext>，
+            # 文件名主干才是 pid；取 seg[-2] 会拿到 "large" 这类尺寸段，整批图共享
+            # 同一个 pid，去重会把多张压成一张、本地文件也会互相覆盖
+            pid = p.get("pid") or (
+                seg[-1].rsplit(".", 1)[0] if seg and "." in seg[-1] else ""
+            )
             ext = (seg[-1].rsplit(".", 1)[-1] if "." in seg[-1] else "jpg").lower()
             orig = to_original(base)
+            # 微博的混合媒体：live 图（动图，type=livephoto，videoSrc 是视频段）
+            # 和视频条目（type=video，url 只是封面）。桌面端 pic_infos 的字段是
+            # video_src，两个名字都防御一下
+            ptype = str(p.get("type") or "")
+            video = p.get("videoSrc") or p.get("video_src") or ""
+            if ptype == "livephoto" and video:
+                kind = "live"
+            elif ptype == "video":
+                kind = "video"
+            else:
+                kind = "pic"
             imgs.append(
                 Image(
                     url=orig,
                     alt_url="" if orig == base else base,
                     pid=pid,
                     ext=ext,
-                    animated=ext == "gif",
+                    animated=ext == "gif" or kind == "live",
+                    kind=kind,
+                    video_url=str(video),
                 )
             )
         return imgs
@@ -479,6 +662,17 @@ class WeiboClient:
                 return body
             err = f"http {st} / {len(body)}B"
         raise WeiboError(f"图片下载失败 {img.pid or img.url}：{err}")
+
+    async def download_media(
+        self, url: str, max_bytes: int = 30 * 1024 * 1024
+    ) -> bytes:
+        """下载 live 图视频段这类媒体文件，不走 /large 改写那一套。"""
+        st, _, body = await self._raw(
+            url, referer="https://weibo.com/", max_bytes=max_bytes
+        )
+        if st != 200 or len(body) <= 1024:
+            raise WeiboError(f"媒体下载失败 http {st} / {len(body)}B")
+        return body
 
     async def _longtext_images(self, mid: str) -> list[Image]:
         try:
@@ -535,14 +729,17 @@ class WeiboClient:
             html,
         )
         pool = body.group(1) if body else html
-        pattern = r"(https?:)?//[\w.]*sinaimg\.cn/[\w/+.-]+/[0-9a-zA-Z]+\.\w+"
+        # 协议头必须是非捕获组：findall 带捕获组时返回的是组内容（"https:" 或空串），
+        # 整个 URL 匹配会被丢掉，文章/页面扫描就一张图都收不到
+        pattern = r"(?:https?:)?//[\w.]*sinaimg\.cn/[\w/+.-]+/[0-9a-zA-Z]+\.\w+"
         urls = re.findall(pattern, pool) or re.findall(pattern, html)
         urls = [u if isinstance(u, str) else u[0] for u in urls]
         seen: set[str] = set()
         out: list[Image] = []
         for u in urls:
-            full = to_original(u)
-            m = SINAIMG_RE.search(full)
+            # 先在原始 URL 上取 pid/token：to_original 会把尺寸段改写成 large，
+            # 改写完再取 token 就永远是 large，default/app/crop 的过滤会形同虚设
+            m = SINAIMG_RE.search(u)
             if not m:
                 continue
             pid, token = m.group(4), m.group(3)
@@ -550,7 +747,9 @@ class WeiboClient:
                 continue
             seen.add(pid)
             ext = m.group(5).lower()
-            out.append(Image(url=full, pid=pid, ext=ext, animated=ext == "gif"))
+            out.append(
+                Image(url=to_original(u), pid=pid, ext=ext, animated=ext == "gif")
+            )
         return out
 
     @staticmethod

@@ -8,3 +8,6 @@ dist/
 .mimosa/
 .zcode/
 .zcodeignore
+.env
+.env.*
+*.session
