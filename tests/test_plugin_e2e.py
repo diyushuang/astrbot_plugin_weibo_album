@@ -162,6 +162,19 @@ def install_fake_astrbot():
     star.Context = object
     star.StarTools = StarTools
 
+    # main.py 从 astrbot.core.utils.astrbot_path 拿 AstrBot 自带的临时目录（data/temp），
+    # 暂存批次必须落在它下面，而不是插件数据目录
+    mod("astrbot.core")
+    mod("astrbot.core.utils")
+    pmod = mod("astrbot.core.utils.astrbot_path")
+
+    def get_astrbot_temp_path():
+        p = data_root / "temp"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    pmod.get_astrbot_temp_path = get_astrbot_temp_path
+
     mod("astrbot.core")
     mod("astrbot.core.platform")
     mod("astrbot.core.platform.sources")
@@ -409,6 +422,10 @@ class FakeNapCat:
                 "has_more": False,
             }
         if action == "upload_image_to_qun_album":
+            if store.get("fail_uploads", 0) > 0:
+                # 业务/权限类错误：不该触发载荷降级，也不该重试，就是这张传不上
+                store["fail_uploads"] -= 1
+                raise ActionFailed(1400, "该成员没有上传相册的权限")
             val = params["file"]
             p = file_parts(val)
             if p is not None and store["reject_path"] > 0:
@@ -436,6 +453,7 @@ def reset_store(store):
     store["uploads"] = []
     store["media"] = []
     store["calls"] = []
+    store["fail_uploads"] = 0
     if EVENT_PLUGIN is not None:
         for k in [k for k in EVENT_PLUGIN._kv if k.startswith("sent:")]:
             EVENT_PLUGIN._kv[k] = {}
@@ -517,6 +535,9 @@ async def main():
         names_up = [Path(u["file"]).name for u in store["uploads"]]
         assert all(n.endswith((".jpg", ".png", ".gif")) for n in names_up), names_up[:3]
         assert "本地暂存已清理" in ev.sent[-1], ev.sent[-1]
+        assert len(ev.sent) == 2, (
+            f"一步到位整批只该有两条群消息（开始提示 + 完成汇总），实际 {len(ev.sent)} 条"
+        )
         assert not list(plugin.root.glob("*")), "传完之后暂存批次该删掉"
         assert len(store["uploads"]) == len(
             {Path(u["file"]).name for u in store["uploads"]}
@@ -534,6 +555,9 @@ async def main():
             f"去重没生效，又多传了 {len(store['uploads']) - before} 张"
         )
         assert any("之前已经传进" in s and "无需重复上传" in s for s in ev2.sent), ev2.sent
+        assert not list(plugin.root.glob("*")), (
+            "整批都已传过时，刚下载的临时文件该当场清掉，不能占着 temp"
+        )
         print(
             "[ok] 用例2 重复执行按 pid 去重，并且提示确实发出去了（stop_event 后不再丢消息）"
         )
@@ -556,6 +580,9 @@ async def main():
         assert not store["uploads"], "没指定相册时不该猜一个就传"
         assert any("微博原图" in s and "其他相册" in s for s in ev4.sent), ev4.sent
         assert any("/传相册" in s for s in ev4.sent), ev4.sent
+        assert len(ev4.sent) == 1, (
+            f"选择相册的提示该合并成一条消息，实际发了 {len(ev4.sent)} 条"
+        )
         folders = sorted(plugin.root.glob("*"), key=lambda p: p.name)
         assert folders, "等用户选相册期间，暂存批次必须还在本地"
         kept = list(folders[-1].glob("*.jpg"))
@@ -772,6 +799,37 @@ async def main():
         assert store["reject_path"] == 999, "一条路径载荷都不该发出去，NapCat 侧零条 ENOENT"
         assert plugin.payload == "path", "关掉同机开关后不该改写那条载荷记忆"
         print("[ok] 用例15 默认配置只发 base64 载荷，NapCat 控制台零条 ENOENT")
+
+        # ---- 用例 16：一步到位批次部分失败后，/传相册 只补传失败的那几张（重传闭环）
+        reset_store(store)
+        plugin.payload = "path"  # path 载荷下相册文件名才是 pid，去重比对才有文件名通道
+        store["reject_path"] = 0
+        store["fail_uploads"] = 3
+        ev20 = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev20)
+        assert len(store["uploads"]) == N_PICS - 3, (
+            len(store["uploads"]),
+            ev20.sent[-1:],
+        )
+        assert any("失败明细" in s for s in ev20.sent), ev20.sent
+        assert "重传" in ev20.sent[-1], ev20.sent[-1]
+        assert plugin._pending.get("123456"), (
+            "一步到位的批次也要登记待上传，/传相册 重传才有依据"
+        )
+        left = list(plugin.root.glob("*/*.jpg"))
+        assert len(left) == 3, [p.name for p in left]
+        store["fail_uploads"] = 0
+        ev21 = make_event("")
+        await rt.dispatch("传相册", ev21)
+        assert len(store["uploads"]) == N_PICS, (
+            len(store["uploads"]),
+            ev21.sent[-1:],
+        )
+        assert "成功 3/" in ev21.sent[-1], ev21.sent[-1]
+        assert not list(plugin.root.glob("*")), "补传完成，暂存目录该清掉"
+        print(
+            "[ok] 用例16 一步到位失败 3 张后 /传相册 只补传那 3 张，闭环后暂存清空"
+        )
 
         await plugin.terminate()
         print("\n全部用例通过")

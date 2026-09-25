@@ -298,26 +298,36 @@ class NapCatAlbum:
         裸路径在 NapCat 侧 checkUriType 判成 Unknown、readFileSync 收到空串，
         报 `ENOENT: ... open ''`。猜错不致命（降级到 base64），学到的方式会排到最前，
         一张图探测一次就够。
+
+        载荷惰性构造：path 命中时连文件都不读（只 stat 确认非空），base64 的
+        1.33 倍内存放大只在真要用它时才付。
         """
-        try:
-            raw = path.read_bytes()
-        except OSError as e:
-            raise NapCatError(f"读取待上传图片失败 {path.name}: {e}") from e
-        if not raw:
-            raise NapCatError("图片数据为空")
-        values = {
-            "path": str(path.resolve()),
-            "base64": "base64://" + base64.b64encode(raw).decode("ascii"),
-        }
         errs: list[str] = []
+        raw: bytes | None = None
         for mode in list(self.modes):
+            if mode == "path":
+                try:
+                    if path.stat().st_size == 0:
+                        raise NapCatError("图片数据为空")
+                except OSError as e:
+                    raise NapCatError(f"读取待上传图片失败 {path.name}: {e}") from e
+                file = str(path.resolve())
+            else:
+                if raw is None:
+                    try:
+                        raw = path.read_bytes()
+                    except OSError as e:
+                        raise NapCatError(f"读取待上传图片失败 {path.name}: {e}") from e
+                    if not raw:
+                        raise NapCatError("图片数据为空")
+                file = "base64://" + base64.b64encode(raw).decode("ascii")
             try:
                 await self.call(
                     "upload_image_to_qun_album",
                     group_id=str(group_id),
                     album_id=str(album_id),
                     album_name=str(album_name or ""),
-                    file=values[mode],
+                    file=file,
                 )
             except NapCatError as e:
                 errs.append(f"{mode}: {e}")

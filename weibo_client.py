@@ -110,6 +110,8 @@ class WeiboClient:
         # 访客 Cookie 按域名分桶：.weibo.cn 与 .weibo.com 的 SUB 同名但取值不同
         self._ck: dict[str, dict[str, str]] = {"cn": {}, "com": {}}
         self._bootstrapping = False
+        # 引导收场信号：并发 5 路同时撞 403 时，只有一路引导，其余等这一路收场再重试
+        self._bootstrap_evt = asyncio.Event()
 
     # ---------- 基础请求 ----------
 
@@ -173,13 +175,19 @@ class WeiboClient:
                         body = bytes(buf)
                     else:
                         body = await r.read()
-                    if (
-                        r.status in (403, 418, 432, 429)
-                        and attempt < 2
-                        and not self._bootstrapping
-                    ):
+                    if r.status in (403, 418, 432, 429) and attempt < 2:
                         last = (r.status, body)
-                        await self.bootstrap_visitor(force=True)
+                        if self._bootstrapping:
+                            # 别的并发请求正在引导访客 Cookie：等它收场再重试，
+                            # 别把这次重试机会浪费在还没就绪的 Cookie 上
+                            try:
+                                await asyncio.wait_for(
+                                    self._bootstrap_evt.wait(), timeout=15
+                                )
+                            except asyncio.TimeoutError:
+                                pass
+                        else:
+                            await self.bootstrap_visitor(force=True)
                         await asyncio.sleep(0.6 * (attempt + 1))
                         continue
                     return r.status, r.url, body
@@ -245,6 +253,9 @@ class WeiboClient:
             return False
         finally:
             self._bootstrapping = False
+            # 放行所有等引导收场的并发请求：set 唤醒现有等待者，clear 只影响后来的
+            self._bootstrap_evt.set()
+            self._bootstrap_evt.clear()
         if ok:
             self._visitor_ok = True
             self._visitor_ts = time.time()
