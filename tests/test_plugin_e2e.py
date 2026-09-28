@@ -605,6 +605,12 @@ async def main():
         assert sa(WEIBO_LINK) == (WEIBO_LINK, "")
         assert sa(WEIBO_MINI_TEXT)[:2] == (WEIBO_MINI_TEXT, ""), sa(WEIBO_MINI_TEXT)
         assert sa(WEIBO_LINK + " | 我的相册")[1] == "我的相册"
+        # 含空格的相册名：剥掉分享后缀后应能识别
+        assert sa(WEIBO_LINK + " 我的相册") == (WEIBO_LINK, "我的相册")
+        assert sa(WEIBO_LINK + " 微博 原图") == (WEIBO_LINK, "微博 原图")
+        # 带分享后缀的文本，剥掉后缀后应能识别相册名
+        assert sa(WEIBO_LINK + " 我的相册 打开微博小程序查看") == (WEIBO_LINK, "我的相册")
+        assert sa(WEIBO_LINK + " 微博原图 打开小程序查看") == (WEIBO_LINK, "微博原图")
         print(
             "[ok] 契约1 split_album 认得 '<链接> <相册名>' 与 | 分隔，且不误读分享文本"
         )

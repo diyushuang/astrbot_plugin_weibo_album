@@ -75,12 +75,18 @@ def _mark(img: Image) -> str:
     return _stem(img).lower()
 
 
+# 分享文本里常见的后缀模板，必须剥掉才能拿到真正的相册名
+_SHARE_BOILERE = re.compile(
+    r"\s*(?:打开(?:微博)?小程序查看|打开微博查看).*$",
+)
+
+
 def split_album(text: str) -> tuple[str, str]:
     """把指令参数拆成 (微博链接文本, 相册名)。
 
-    App 复制出来的分享文本本身就带空格，所以不能简单地把尾部 token 当相册名，
-    否则 "…打开微博小程序查看" 会被当成相册。只认两种无歧义写法：显式用 | 分隔，
-    或者整段就是 "<链接> <单个短词>"。
+    App 复制出来的分享文本本身就带空格（"…打开微博小程序查看"），
+    所以先剥掉这类已知后缀，再允许相册名含空格。两种无歧义写法：
+    显式用 | 分隔，或者 "<链接> <相册名>"。
     """
     text = (text or "").strip()
     for sep in ("|", "｜"):
@@ -89,8 +95,8 @@ def split_album(text: str) -> tuple[str, str]:
             return link.strip(), album.strip()
     found = list(ANY_URL_RE.finditer(text))
     if len(found) == 1 and not text[: found[0].start()].strip():
-        album = text[found[0].end() :].strip()
-        if album and " " not in album and len(album) <= 24:
+        album = _SHARE_BOILERE.sub("", text[found[0].end() :]).strip()
+        if album and len(album) <= 24:
             return text[: found[0].end()].strip(), album
     return text, ""
 
