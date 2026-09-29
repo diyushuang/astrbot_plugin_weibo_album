@@ -12,6 +12,12 @@ aiocqhttp 那一侧的行为——成功返回 data，失败抛 ActionFailed(ret
   `ENOENT: ... open '/abs'`。
 - 参数校验失败：retcode 1400（不是 1400 之外的什么语义码）
 - 相册接口不会产出 1401/1404 这类语义码，语义只在 message 里
+- **NapCat 传相册是自己 fetch h5.qzone.qq.com 串行发 16KB 分片**，非 2xx 就抛
+  `HTTP error! status: 502`（napcat-core/apis/webapi.ts 的 uploadQunAlbumSlice），
+  OneBotAction 的 catch 统一包成 **retcode 1200**；`_handle` 内的异常都走这条路。
+  QQ 相册网关偶发 5xx 是常态，必须退避重试，不能一次就判这张失败。
+- AstrBot v4.28 锁 `aiocqhttp>=1.4.4`，反向 WS 的 `api_timeout_sec=180`：等满抛
+  `NetworkError('WebSocket API call timeout')`，**这种没有响应体**，NapCat 可能还在传。
 上一轮审计就是因为 mock 用了 "failed to read file" 这种自创文案，才让 base64 降级链
 在真机上被误判成"接口不存在"而直接放弃。
 """
@@ -44,12 +50,68 @@ ALBUMS.append(
 ALBUMS.append("0_stralbum00")  # Array(Any)，声明上是对象，实测见过裸串
 
 
-class ActionFailed(Exception):
-    """port of aiocqhttp.ActionFailed：retcode/message 藏在 .info 里，str() 只剩个壳。"""
+class Error(Exception):
+    """port of aiocqhttp.exceptions.Error。"""
+
+
+class ApiError(Error, RuntimeError):
+    """port of aiocqhttp.exceptions.ApiError。"""
+
+
+class ActionFailed(ApiError):
+    """port of aiocqhttp 1.4.4 的 ActionFailed（AstrBot v4.28 锁的就是 >=1.4.4）。
+
+    照抄上游：原始响应挂在 **`.result`**，`retcode` 是 property，`str()` 只有
+    `<ActionFailed k=v, ...>` 这个壳。**1.3 及更早才叫 `.info`** —— 之前替身按 `.info`
+    写，于是"插件读不到 retcode/message、把整个壳当文案抛出去"这件事在测试里全绿。
+    """
 
     def __init__(self, retcode: int, message: str):
-        super().__init__("Action execution failed.")
-        self.info = {"retcode": retcode, "message": message}
+        # NapCat 走 WS 回的响应体字段就这几个，stream 是它自己加的
+        self.result = {
+            "status": "failed",
+            "retcode": retcode,
+            "data": None,
+            "message": message,
+            "wording": message,
+            "echo": {"seq": 431},
+            "stream": "normal-action",
+        }
+
+    @property
+    def retcode(self) -> int:
+        return self.result["retcode"]
+
+    def __repr__(self):
+        return (
+            "<ActionFailed "
+            + ", ".join(f"{k}={v!r}" for k, v in self.result.items())
+            + ">"
+        )
+
+    def __str__(self):
+        return self.__repr__()
+
+
+class HttpFailed(ApiError):
+    """port of aiocqhttp 1.4.4 的 HttpFailed：HTTP 通道响应码不是 2xx。"""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+    def __repr__(self):
+        return f"<HttpFailed, status_code={self.status_code}>"
+
+    def __str__(self):
+        return self.__repr__()
+
+
+class NetworkError(Error, IOError):
+    """port of aiocqhttp 1.4.4 的 NetworkError：连不上 / 等不到响应（继承 IOError）。"""
+
+
+# AstrBot 的反向 WS api_timeout_sec=180，等满就是这个文案，NapCat 那边可能还在传
+WS_TIMEOUT = "WebSocket API call timeout"
 
 
 def value_to_size(value: str) -> int:
@@ -72,6 +134,8 @@ class FakeNapCat:
         self.no_has_more = (
             False  # media_list 的声明里没有 has_more，要能靠 attach_info 翻页
         )
+        # action -> [剩余次数, 异常工厂]：注入瞬时故障，用真机的异常类型与文案
+        self.inject: dict[str, list] = {}
 
     def uploads(self) -> list[dict]:
         return [p for a, p in self.seen if a == "upload_image_to_qun_album"]
@@ -83,6 +147,10 @@ class FakeNapCat:
                 1400,
                 f"group_id 必须是字符串，收到 {type(params.get('group_id')).__name__}",
             )
+        inj = self.inject.get(action)
+        if inj and inj[0] > 0:
+            inj[0] -= 1
+            raise inj[1]()
         if action == "get_qun_album_list":
             attach = str(params.get("attach_info") or "")
             start = int(attach) if attach.isdigit() else 0
@@ -135,7 +203,8 @@ class FakeNapCat:
 
 async def main():
     fake = FakeNapCat()
-    nc = NapCatAlbum(fake.caller, retries=2, same_host=True)
+    # backoff 调小：这些用例要跑十几次退避，真按 1s/2s 等就是白耗几十秒
+    nc = NapCatAlbum(fake.caller, retries=2, same_host=True, backoff=0.01)
     tmp = Path(tempfile.mkdtemp(prefix="wbalbum_"))
     try:
         albums = await nc.list_albums("123456")
@@ -186,6 +255,92 @@ async def main():
             len(fake.seen) - before,
         )
         print("[ok] 频控类错误会在同一载荷方式内退避重试")
+
+        # ---- 用户实机日志（2026-09-29）：retcode=1200 + message='HTTP error! status: 502'
+        # NapCat 的 uploadQunAlbumSlice fetch h5.qzone.qq.com 吃到 502 就抛这个，
+        # OneBotAction 的 catch 包成 retcode 1200。QQ 相册网关抖一下就丢一张图是不该有的。
+        gateway_502 = "HTTP error! status: 502"
+        fake.inject["upload_image_to_qun_album"] = [
+            1,
+            lambda: ActionFailed(1200, gateway_502),
+        ]
+        before, done = len(fake.seen), len(fake.sizes)
+        mode = await nc.upload_file("123456", aid, "微博原图", small)
+        assert mode == "path", mode
+        assert len(fake.seen) - before == 2, len(fake.seen) - before
+        assert len(fake.sizes) - done == 1, (
+            f"重试成功只该传成 1 张，实际 {len(fake.sizes) - done} 张"
+        )
+        print("[ok] QQ 相册网关 502(retcode=1200) 会退避重试，第二次成功且没有传重")
+
+        # 一直 502：重试耗尽后文案要可读，不能把 <ActionFailed ...> 整个壳抛给用户
+        fake.inject["upload_image_to_qun_album"] = [
+            99,
+            lambda: ActionFailed(1200, gateway_502),
+        ]
+        before = len(fake.seen)
+        try:
+            await nc.upload_file("123456", aid, "微博原图", small)
+            raise AssertionError("应当报错")
+        except NapCatError as e:
+            assert "retcode=1200" in str(e), str(e)
+            assert "502" in str(e) and "<ActionFailed" not in str(e), str(e)
+            assert "网关" in str(e), str(e)
+            assert not e.file_unusable and not e.action_missing
+            assert len(fake.seen) - before == 3, (
+                len(fake.seen) - before,
+                "retries=2 应该一共试 3 次",
+            )
+            print("[ok] 502 重试耗尽后给出可读文案（retcode + 网关提示），不再是异常壳")
+        fake.inject.clear()
+
+        # 压根没等到响应（反向 WS 等满 180s）：NapCat 可能还在传，上传不幂等，
+        # 盲重试的后果就是相册里出现两张一样的图 —— 群里灰色提示会比成功张数多
+        fake.inject["upload_image_to_qun_album"] = [
+            99,
+            lambda: NetworkError(WS_TIMEOUT),
+        ]
+        before = len(fake.seen)
+        try:
+            await nc.upload_file("123456", aid, "微博原图", small)
+            raise AssertionError("应当报错")
+        except NapCatError as e:
+            assert "可能其实已经传上去" in str(e), str(e)
+        assert len(fake.seen) - before == 1, (
+            len(fake.seen) - before,
+            "拿不到响应时上传不该盲重试",
+        )
+        print("[ok] 等不到响应时上传不盲重试，并提示这张可能已经传上去了")
+
+        # 只读接口没有副作用，同样的"没响应"就该重试
+        fake.inject["get_qun_album_list"] = [1, lambda: NetworkError(WS_TIMEOUT)]
+        before = len(fake.seen)
+        albums = await nc.list_albums("123456")
+        assert len(albums) == 13, len(albums)
+        assert len(fake.seen) - before == 3, (
+            len(fake.seen) - before,
+            "首页失败重试 1 次 + 翻页 1 次",
+        )
+        print("[ok] 只读接口遇到连接层错误照常重试，不受上传的不幂等约束")
+
+        # HTTP 通道（不是 WS）：5xx 值得重试，401/404 是 api_root/token 配错了，重试只是白等
+        fake.inject["get_qun_album_list"] = [99, lambda: HttpFailed(502)]
+        before = len(fake.seen)
+        try:
+            await nc.list_albums("123456")
+            raise AssertionError("应当报错")
+        except NapCatError as e:
+            assert "502" in str(e), str(e)
+            assert len(fake.seen) - before == 3, len(fake.seen) - before
+        fake.inject["get_qun_album_list"] = [99, lambda: HttpFailed(404)]
+        before = len(fake.seen)
+        try:
+            await nc.list_albums("123456")
+            raise AssertionError("应当报错")
+        except NapCatError:
+            assert len(fake.seen) - before == 1, len(fake.seen) - before
+        fake.inject.clear()
+        print("[ok] HttpFailed：5xx 退避重试，404 一次就放弃")
 
         fake.reject_path = 5  # NapCat 在另一个容器，一直看不见插件写的路径
         before = len(fake.seen)
@@ -275,7 +430,7 @@ async def main():
             raise AssertionError("应当报错")
         except NapCatError as e:
             assert len(fake.seen) - before == 1, len(fake.seen) - before
-            assert e.action_missing, "应从 ActionFailed.info 取出 message 并正确分类"
+            assert e.action_missing, "应从 ActionFailed.result 取出 message 并正确分类"
             print("[ok] 命中 NapCat 真实的『不支持的API』文案且不重试:", str(e)[:50])
 
         # 接口不存在时，降级链应该第一轮就断掉

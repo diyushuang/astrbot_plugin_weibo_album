@@ -13,6 +13,7 @@
 
 import asyncio
 import base64
+import random
 import re
 from pathlib import Path
 
@@ -48,16 +49,71 @@ _FILE_UNUSABLE_HINTS = (
     "无法读取",
     "没有那个文件或目录",
 )
+# NapCat 传相册不是走内核，而是自己 fetch h5.qzone.qq.com 串行发 16KB 分片
+# （napcat-core/apis/webapi.ts 的 uploadQunAlbumSlice），非 2xx 就抛
+# `HTTP error! status: 502`，OneBot 侧统一包成 retcode=1200。
+# 这种是 QQ 相册网关临时挡人，跟插件这边怎么传没关系，只能退避重试。
+_UPSTREAM_HINTS = (
+    "http error",
+    "bad gateway",
+    "service unavailable",
+    "gateway time",
+    "internal server error",
+)
 # 走 AstrBot 的 OneBot 连接时 NapCat 只会给出 1400/1200/1404 这类码，
 # 语义靠 message 判断比靠 retcode 可靠。
 _HINT_RULES = (
+    (
+        _UPSTREAM_HINTS,
+        "QQ 相册网关临时报错，NapCat 传分片被挡，稍后 /传相册 重传即可",
+    ),
     (
         ("permission", "forbidden", "not allowed", "权限"),
         "权限不足：请确认机器人在本群被允许上传相册",
     ),
     (("album", "相册"), "相册可能已被删除或 ID 有误，用 /群相册列表 重新确认"),
 )
-_RETRYABLE_HINTS = ("频繁", "重试", "超时", "timeout", "frequent", "busy", "系统繁忙")
+# 值得退避重试的瞬时故障：QQ 相册网关抖动 + 连接层面的问题 + 频控。
+_RETRYABLE_HINTS = _UPSTREAM_HINTS + (
+    "socket hang up",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "remote end closed",
+    "other side closed",
+    "fetch failed",
+    "econnreset",
+    "etimedout",
+    "econnrefused",
+    "network",
+    "频繁",
+    "重试",
+    "超时",
+    "timeout",
+    "frequent",
+    "busy",
+    "系统繁忙",
+    "稍后",
+    "网关",
+    "网络",
+)
+# 值得重试的 HTTP 码：5xx 是对方服务器的事，408/429 是"等一下就好"。
+# 401/403/404 不在此列——那是 api_root 或 token 配错了，重试只是白等。
+_RETRY_STATUS = frozenset({408, 429, *range(500, 600)})
+_HTTP_STATUS_RE = re.compile(r"(?:status|code|状态码)\D{0,3}(\d{3})\b", re.I)
+# 连不上 NapCat / 等不到响应这一类异常没有响应体可读，只能按类型名认：
+# AstrBot 用的是 aiocqhttp 反向 WS（api_timeout_sec=180），超时抛 NetworkError，
+# 它继承 IOError，所以 OSError 一并覆盖了 socket 层面的各种断连。
+_TRANSPORT_ERRORS = frozenset(
+    {
+        "NetworkError",
+        "HttpFailed",
+        "TimeoutError",
+        "OSError",
+        "ClientError",
+        "ServerDisconnectedError",
+    }
+)
 
 
 class NapCatError(Exception):
@@ -93,8 +149,33 @@ def pick(d: dict, keys: tuple[str, ...], default: str = "") -> str:
     return default
 
 
-def _retryable(msg: str) -> bool:
-    return _has(msg, _RETRYABLE_HINTS)
+def _payload(e: BaseException) -> dict:
+    """NapCat 的原始响应体。
+
+    aiocqhttp 1.4 起 ActionFailed 把它挂在 `.result`（1.3 及更早叫 `.info`），
+    而 `str(e)` 只剩 `<ActionFailed status='failed', retcode=1200, ...>` 这个壳，
+    retcode 与 message 都在响应体里，读错属性就只能把整个壳当文案抛给用户。
+    """
+    for attr in ("result", "info"):
+        v = getattr(e, attr, None)
+        if isinstance(v, dict):
+            return v
+    return {}
+
+
+def _transient(msg: str, e: BaseException | None = None) -> bool:
+    """这条错误是瞬时的吗（QQ 相册网关 5xx、连接抖动、频控）—— 只有这类值得退避重试。"""
+    if _has(msg, _RETRYABLE_HINTS):
+        return True
+    m = _HTTP_STATUS_RE.search(msg or "")
+    if m and int(m.group(1)) in _RETRY_STATUS:
+        return True
+    if e is None:
+        return False
+    status = getattr(e, "status_code", None)  # aiocqhttp HttpFailed：HTTP 通道的响应码
+    if isinstance(status, int):
+        return status in _RETRY_STATUS
+    return any(c.__name__ in _TRANSPORT_ERRORS for c in type(e).__mro__)
 
 
 def _classify(text: str) -> tuple[str, bool, bool]:
@@ -115,10 +196,11 @@ def _classify(text: str) -> tuple[str, bool, bool]:
     )
 
 
-def _fail(action: str, detail: str, code: int = 0) -> NapCatError:
+def _fail(action: str, detail: str, code: int = 0, note: str = "") -> NapCatError:
     text, missing, unusable = _classify(detail)
+    msg = f"{action} 失败 retcode={code} {text}" if code else f"{action} 失败 {text}"
     return NapCatError(
-        f"{action} 失败 retcode={code} {text}" if code else f"{action} 失败 {text}",
+        f"{msg}；{note}" if note else msg,
         action_missing=missing,
         file_unusable=unusable,
     )
@@ -133,12 +215,14 @@ class NapCatAlbum:
         retries: int = 2,
         preferred: str = "",
         same_host: bool = False,
+        backoff: float = 1.0,
     ):
         if caller is None:
             raise NapCatError("拿不到 AstrBot 与 NapCat 之间的连接")
         self.caller = caller
         self.retries = retries
         self.same_host = same_host
+        self.backoff = backoff
         self.modes = self._ordered(preferred, same_host)
 
     @staticmethod
@@ -155,34 +239,52 @@ class NapCatAlbum:
             modes.insert(0, preferred)
         return modes
 
-    async def call(self, action: str, **params) -> dict:
+    async def _backoff(self, attempt: int) -> None:
+        # 抖动不能省：整批图是并发在传的，撞进同一个 502 窗口的几张会同时退避，
+        # 不加抖动它们又会同时撞上去
+        base = min(2.0**attempt, 8.0) * self.backoff
+        await asyncio.sleep(base + random.uniform(0, 0.5 * self.backoff))
+
+    async def call(self, action: str, *, idempotent: bool = True, **params) -> dict:
+        """调一个 action，瞬时故障自己退避重试。
+
+        idempotent=False 表示重复调用会有副作用（上传就是）。这时只有 NapCat 明确回了
+        失败响应才重试；连响应都没拿到（反向 WS 等满 180s 就是这种）说明 NapCat 可能还在
+        传，盲重试的结果是相册里出现两张一样的图，宁可把这张判失败留给 /传相册 补。
+        """
         body = {k: v for k, v in params.items() if v is not None}
         last = ""
         for attempt in range(self.retries + 1):
+            more = attempt < self.retries
             try:
                 res = await self.caller(action, dict(body))
-            except Exception as e:  # aiocqhttp ActionFailed / 连接异常
-                # ActionFailed 把 retcode/message 藏在 .info 里，str() 只剩个壳
-                info = getattr(e, "info", None)
-                info = info if isinstance(info, dict) else {}
+            except Exception as e:  # aiocqhttp ActionFailed / HttpFailed / NetworkError
+                info = _payload(e)
                 code = info.get("retcode", 0) or 0
                 last = (
                     str(info.get("message") or info.get("wording") or "").strip()
-                    or str(e)
+                    or str(e).strip()
                     or repr(e)
                 )
-                if _retryable(last) and attempt < self.retries:
-                    await asyncio.sleep(2.0**attempt)
+                # info 非空 = NapCat 回过话，这一张确定没传上去，重试不会传重
+                if more and _transient(last, e) and (info or idempotent):
+                    await self._backoff(attempt)
                     continue
-                raise _fail(action, last, code) from e
+                note = (
+                    ""
+                    if info or idempotent
+                    else "没拿到 NapCat 的失败响应，这张可能其实已经传上去了，重传前先在相册里确认"
+                )
+                raise _fail(action, last, code, note) from e
             wrapped = isinstance(res, dict) and "retcode" in res
             j = res if wrapped else {"retcode": 0, "data": res or {}}
             code = j.get("retcode", 0)
             if code != 0 or j.get("status") == "failed":
+                # 走到这里说明 NapCat 回话了，失败是确定的，不存在传重风险
                 msg = j.get("message") or j.get("wording") or ""
-                if _retryable(msg) and attempt < self.retries:
+                if more and _transient(msg):
                     last = msg
-                    await asyncio.sleep(2.0**attempt)
+                    await self._backoff(attempt)
                     continue
                 raise _fail(action, msg or str(j)[:160], code)
             return j.get("data") or {}
@@ -330,6 +432,7 @@ class NapCatAlbum:
             try:
                 await self.call(
                     "upload_image_to_qun_album",
+                    idempotent=False,
                     group_id=str(group_id),
                     album_id=str(album_id),
                     album_name=str(album_name or ""),

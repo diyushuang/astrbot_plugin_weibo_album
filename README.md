@@ -11,7 +11,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-informational.svg)]()
 [![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A54.24-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![NapCat](https://img.shields.io/badge/NapCat-%E2%89%A54.8.101-red.svg)](https://github.com/NapNeko/NapCatQQ)
-[![Version](https://img.shields.io/badge/Version-v1.6.0-success.svg)]()
+[![Version](https://img.shields.io/badge/Version-v1.6.1-success.svg)]()
 
 </div>
 
@@ -90,7 +90,7 @@
 
 安装方式：
 
-1. **推荐**：AstrBot WebUI → 插件管理 → 上传发布 zip（`astrbot_plugin_weibo_album_v1.6.0.zip`）
+1. **推荐**：AstrBot WebUI → 插件管理 → 上传发布 zip（`astrbot_plugin_weibo_album_v1.6.1.zip`）
 2. 从源码目录复制，**目录名要和 `metadata.yaml` 里的 `name` 一致**，且只复制发布内容
    （`main.py`、`weibo_client.py`、`napcat_album.py`、`metadata.yaml`、`_conf_schema.json`、
    `requirements.txt`、`README.md`），`tests/`、`pyproject.toml`、`.git` 不需要进插件目录：
@@ -175,6 +175,13 @@ schema 强类型）。目标按「直链 > 口令 > 短链/中转字段」的优
   "文件没了台账也没记"），空目录 `rmdir`；失败张等 `/传相册` 重传，新抓取/过期/进程重启都会清掉。
 - NapCat 走 OneBot 连接只会见到 1400/1200/1404 这类码，可操作提示按 message 文本判断，
   不承诺具体 retcode。
+- 瞬时故障自己退避重试（默认 3 次尝试，1s/2s 再加抖动）：NapCat 传相册是自己 fetch
+  `h5.qzone.qq.com` 串行发 16KB 分片，QQ 相册网关偶发 5xx 时它抛的是
+  `HTTP error! status: 502`（OneBot 侧统一包成 retcode 1200）——这跟插件怎么传没关系，
+  重试基本就能过，所以不当成这张图的失败。
+- 但**拿不到 NapCat 响应时上传不重试**：AstrBot 的反向 WS `api_timeout_sec=180`，等满只代表
+  插件这边不等了，NapCat 那边可能还在传分片；上传不幂等，盲重试会让相册里多出两张一样的图。
+  这种会把该张判失败，并在失败明细里注明"可能其实已经传上去了"，重传前先看一眼相册。
 
 </details>
 
@@ -187,7 +194,8 @@ schema 强类型）。目标按「直链 > 口令 > 短链/中转字段」的优
 - **合并转发的消息暂不支持**：请用"引用回复"引用那张卡片，或直接粘链接。
 - NapCat 没有创建相册的接口，目标相册必须先存在（解析失败时会带上现有相册清单）。
 - 传图是"一张一次调用 + 多张并发"，做不到一个请求传多张；QQ 相册的"最近上传"动态对每张图
-  各记一条记录，是协议端行为。并发数受 QQ 侧频控约束，调太高会报"分片 N 上传失败/操作频繁"。
+  各记一条记录，是协议端行为。并发数受 QQ 侧频控约束，调太高会报"分片 N 上传失败/操作频繁"；
+  网关侧偶发的 502 也常与并发过高有关，插件会退避重试，仍失败就把 `upload_concurrency` 调低。
 - 只对接 NapCat 的接口名。LLOneBot 等协议端用另一套名字（`get_group_album_list` /
   `upload_group_album` + `files=[]`），本插件未适配。
 - 只搬图片，不带微博正文；纯文字微博会被跳过。混在图里的**真视频条目只跳过不传**

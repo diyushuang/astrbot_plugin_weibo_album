@@ -460,11 +460,37 @@ def file_parts(value):
 
 
 class ActionFailed(Exception):
-    """port of aiocqhttp.ActionFailed：retcode/message 藏在 .info 里，str() 只剩个壳。"""
+    """port of aiocqhttp 1.4.4 的 ActionFailed（AstrBot v4.28 锁 >=1.4.4）。
+
+    照抄上游：原始响应挂在 `.result`（**1.3 及更早才叫 `.info`**），`retcode` 是 property，
+    `str()` 只剩 `<ActionFailed k=v, ...>` 这个壳。替身这里写宽松过一次，结果
+    "插件读不到 retcode/message、把整个壳当文案抛给用户"在测试里全绿。
+    """
 
     def __init__(self, retcode, message):
-        super().__init__("Action execution failed.")
-        self.info = {"retcode": retcode, "message": message}
+        self.result = {
+            "status": "failed",
+            "retcode": retcode,
+            "data": None,
+            "message": message,
+            "wording": message,
+            "echo": {"seq": 431},
+            "stream": "normal-action",
+        }
+
+    @property
+    def retcode(self):
+        return self.result["retcode"]
+
+    def __repr__(self):
+        return (
+            "<ActionFailed "
+            + ", ".join(f"{k}={v!r}" for k, v in self.result.items())
+            + ">"
+        )
+
+    def __str__(self):
+        return self.__repr__()
 
 
 class FakeNapCat:
@@ -520,6 +546,11 @@ class FakeNapCat:
             if p is not None and store["reject_path"] > 0:
                 store["reject_path"] -= 1
                 raise ActionFailed(1400, "ENOENT: no such file or directory, open ''")
+            if store.get("gateway_502", 0) > 0:
+                # NapCat 的 uploadQunAlbumSlice fetch h5.qzone.qq.com 吃到 502 就抛这个，
+                # OneBotAction 的 catch 统一包成 retcode 1200（用户 2026-09-29 实机日志）
+                store["gateway_502"] -= 1
+                raise ActionFailed(1200, "HTTP error! status: 502")
             if p is None:
                 # NapCat 的 checkUriType 对 base64 载荷用 randomUUID 落盘，
                 # 相册里显示的文件名就是它 —— 微博 pid 再也对不上了
@@ -544,6 +575,7 @@ def reset_store(store):
     store["calls"] = []
     store["fail_uploads"] = 0
     store["fail_downloads"] = 0
+    store["gateway_502"] = 0
     store["reject_path"] = 0
     store["hang_uploads"] = False
     store["album_names"] = None
@@ -946,6 +978,22 @@ async def main():
         assert "成功 3/" in ev21.sent[-1], ev21.sent[-1]
         assert not list(plugin.root.glob("*")), "补传完成，暂存目录该清掉"
         print("[ok] 用例16 一步到位失败 3 张后 /传相册 只补传那 3 张，闭环后暂存清空")
+
+        # ---- 用例 16b：QQ 相册网关偶发 502（用户 2026-09-29 实机日志），插件自己退避重试
+        reset_store(store)
+        store["gateway_502"] = 3
+        ev22 = make_event(WEIBO_LINK)
+        await rt.dispatch(f"微博相册 {WEIBO_LINK} | 微博原图", ev22)
+        attempts = [c for c in store["calls"] if c[0] == "upload_image_to_qun_album"]
+        assert len(attempts) == N_PICS + 3, (
+            f"502 的那 3 张该各多重试一次，实际发了 {len(attempts)} 次上传"
+        )
+        assert len(store["uploads"]) == N_PICS, (
+            f"重试成功的每张只该落一张，实际 {len(store['uploads'])} 张"
+        )
+        assert not any("失败明细" in s for s in ev22.sent), ev22.sent
+        assert f"成功 {N_PICS}/{N_PICS}" in ev22.sent[-1], ev22.sent[-1]
+        print("[ok] 用例16b 网关 502 被退避重试兜住，整批仍报全部成功且没有传重")
 
         # ---- 用例 17：skip_exists=False 时部分失败，重传不能对已删的成功张报错
         reset_store(store)
