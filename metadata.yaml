@@ -1,8 +1,8 @@
 name: astrbot_plugin_weibo_album
-display_name: 微博原图传群相册
-desc: 抓取指定微博链接/微博小程序里的全部原图，并通过 NapCat 上传到 QQ 群相册的指定相册。
-short_desc: 微博原图一键搬进群相册
-version: v1.6.1
+display_name: 微博/小红书原图传群相册
+desc: 抓取微博或小红书链接/分享卡片里的全部图片（平台自动识别，无需区分命令；微博原图与 live 图转 GIF、小红书笔记图集无水印优先），并通过 NapCat 上传到 QQ 群相册的指定相册。
+short_desc: 微博/小红书图片一键搬进群相册
+version: v1.8.0
 author: wbalbum
 repo: https://github.com/wbalbum/astrbot_plugin_weibo_album
 support_platforms:

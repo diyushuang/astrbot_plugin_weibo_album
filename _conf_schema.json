@@ -7,11 +7,12 @@
     "hint": "一般留空即可，插件会自动走访客通道；只有个别受限微博才需要填登录 Cookie",
     "obvious_hint": true
   },
-  "default_album": {
-    "description": "默认目标相册名",
+  "xhs_cookie": {
+    "description": "小红书 Cookie",
     "type": "string",
-    "default": "微博原图",
-    "hint": "可用 /群相册列表 查看现有相册名；NapCat 没有建相册接口，相册需先在群里手动创建。本群用 /绑定相册 绑定的相册优先于这一项",
+    "default": "",
+    "secret": true,
+    "hint": "一般留空即可，游客通道能抓大部分笔记（explore 页无水印大图）；笔记被限制或一直提示链接失效时，再从浏览器登录小红书后复制 Cookie 填进来",
     "obvious_hint": true
   },
   "max_images": {

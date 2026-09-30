@@ -733,7 +733,6 @@ class WeiboClient:
         # 整个 URL 匹配会被丢掉，文章/页面扫描就一张图都收不到
         pattern = r"(?:https?:)?//[\w.]*sinaimg\.cn/[\w/+.-]+/[0-9a-zA-Z]+\.\w+"
         urls = re.findall(pattern, pool) or re.findall(pattern, html)
-        urls = [u if isinstance(u, str) else u[0] for u in urls]
         seen: set[str] = set()
         out: list[Image] = []
         for u in urls:

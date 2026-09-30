@@ -65,13 +65,13 @@ _UPSTREAM_HINTS = (
 _HINT_RULES = (
     (
         _UPSTREAM_HINTS,
-        "QQ 相册网关临时报错，NapCat 传分片被挡，稍后 /传相册 重传即可",
+        "QQ 相册网关临时报错，NapCat 传分片被挡，稍后 /补传 重传即可",
     ),
     (
         ("permission", "forbidden", "not allowed", "权限"),
         "权限不足：请确认机器人在本群被允许上传相册",
     ),
-    (("album", "相册"), "相册可能已被删除或 ID 有误，用 /群相册列表 重新确认"),
+    (("album", "相册"), "相册可能已被删除或 ID 有误，用 /列相册 重新确认"),
 )
 # 值得退避重试的瞬时故障：QQ 相册网关抖动 + 连接层面的问题 + 频控。
 _RETRYABLE_HINTS = _UPSTREAM_HINTS + (
@@ -250,7 +250,7 @@ class NapCatAlbum:
 
         idempotent=False 表示重复调用会有副作用（上传就是）。这时只有 NapCat 明确回了
         失败响应才重试；连响应都没拿到（反向 WS 等满 180s 就是这种）说明 NapCat 可能还在
-        传，盲重试的结果是相册里出现两张一样的图，宁可把这张判失败留给 /传相册 补。
+        传，盲重试的结果是相册里出现两张一样的图，宁可把这张判失败留给 /补传 补。
         """
         body = {k: v for k, v in params.items() if v is not None}
         last = ""
@@ -348,7 +348,7 @@ class NapCatAlbum:
 
         album_name 是要发给 QQ 的 sAlbumName，不是展示用的摆设，所以即使用户直接给了
         ID 也要回查真实名字，不能拿 ID 顶替。default_name 只在列表拉不到、ID 直通时
-        兜底展示名（比如绑定记录里存过的那个），避免把 ID 当名字发给 QQ。
+        兜底展示名，避免把 ID 当名字发给 QQ。
         """
         want = (want or "").strip()
         if not want:
@@ -386,7 +386,7 @@ class NapCatAlbum:
         name = pick(hit, ALBUM_LIST_ITEM_NAME_KEYS, want)
         if not aid:
             raise NapCatError(
-                f"相册「{name}」缺少 album_id，请改用 /群相册列表 里的相册 ID"
+                f"相册「{name}」缺少 album_id，请改用 /列相册 里的相册 ID"
             )
         return aid, name
 

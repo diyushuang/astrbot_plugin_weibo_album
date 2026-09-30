@@ -1,7 +1,7 @@
-"""微博原图 -> QQ 群相册。
+"""微博 / 小红书原图 -> QQ 群相册。
 
-给一条微博链接（网页版 / 移动端 / 小程序分享文本均可），或直接引用（回复）QQ 里
-那条微博小程序卡片 / 分享消息发指令，抓取其中全部原图，并通过 NapCat 上传到指定群相册。
+给一条微博或小红书笔记链接（网页版 / 移动端 / 分享文本均可），或直接引用（回复）QQ 里
+那条小程序卡片 / 分享消息发指令，抓取其中全部原图，并通过 NapCat 上传到指定群相册。
 """
 
 import asyncio
@@ -42,10 +42,18 @@ from .weibo_client import (
     has_share_target,
     target_from_share,
 )
+from .xhs_client import (
+    XHSClient,
+    XhsError,
+    has_xhs_target,
+    xhs_target_from_share,
+)
+
+_GRAB_ERRORS = (WeiboError, XhsError, NapCatError)
 
 PREFETCH = 5  # 下载并发度：整批先落到本地，之后才传相册
 UPLOAD_CONC = 3  # 同时在传的张数。 NapCat 每张图内部要串行发几十个 16KB 分片，串行太慢
-PENDING_TTL = 1800  # 下载完等 /传相册 选相册的存活时间
+PENDING_TTL = 1800  # 下载完等 /补传 选相册的存活时间
 LEDGER_TTL = 30 * 86400  # "本插件传过这张"的记录留多久
 LEDGER_MAX = 2000  # 每个相册最多记多少条
 MAX_ALBUM_CHOICES = 15  # 选择列表一次最多列几个相册
@@ -77,7 +85,7 @@ def _mark(img: Image) -> str:
 
 # 分享文本里常见的后缀模板，必须剥掉才能拿到真正的相册名
 _SHARE_BOILERE = re.compile(
-    r"\s*(?:打开(?:微博)?小程序查看|打开微博查看).*$",
+    r"\s*(?:打开(?:微博)?小程序查看|打开微博查看|(?:复制|点击)?(?:此链接|链接)?\s*打开小红书.*)$",
 )
 
 
@@ -98,11 +106,14 @@ def split_album(text: str) -> tuple[str, str]:
         album = _SHARE_BOILERE.sub("", text[found[0].end() :]).strip()
         if album and len(album) <= 24:
             return text[: found[0].end()].strip(), album
+        if not album:
+            # 链接后只剩分享文案（或啥都没有）：干净返回，别把文案混进链接
+            return text[: found[0].end()].strip(), ""
     return text, ""
 
 
 class WeiboAlbumPlugin(Star):
-    """把微博里的原图整套搬进 QQ 群相册：先整批抓到本地，再传到选定的相册。"""
+    """把微博 / 小红书笔记里的原图整套搬进 QQ 群相册：先整批抓到本地，再传到选定的相册。"""
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -110,15 +121,15 @@ class WeiboAlbumPlugin(Star):
         self._session: aiohttp.ClientSession | None = None
         self._wb: WeiboClient | None = None
         self._wb_sig: tuple = ()  # 上次建 WeiboClient 时的 (cookie, timeout, proxy)
+        self._xhs: XHSClient | None = None
+        self._xhs_sig: tuple = ()  # 上次建 XHSClient 时的 (cookie, timeout, proxy)
         # 按群互斥。WeakValueDictionary：处理中的锁有局部强引用不会被回收，
         # 处理完没人等就随 GC 走，不会每个出现过的群漏一把锁；setdefault 全程
         # 没有 await 点，两个协程不会各拿各的锁
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
-        self._pending: dict[
-            str, dict
-        ] = {}  # gid -> 下载完在等 /传相册 指定相册的那批图
+        self._pending: dict[str, dict] = {}  # gid -> 下载完在等 /补传 指定相册的那批图
         self._inflight: set[asyncio.Task] = set()  # 在飞的上传任务，terminate 时要撤
         self.payload = ""  # 同机探测过能用的载荷方式（path / base64）
         self._ffmpeg = ""  # ffmpeg 可执行文件路径，initialize 时探测
@@ -156,6 +167,7 @@ class WeiboAlbumPlugin(Star):
             self._inflight.clear()
         self._pending.clear()
         self._wb = None
+        self._xhs = None
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -163,7 +175,7 @@ class WeiboAlbumPlugin(Star):
     def _sweep_pending(self, keep: str | None = None) -> None:
         """把过了 TTL 的暂存批次连文件带登记一起清掉。
 
-        只靠 /传相册 惰性检查的话，抓完不传的批次会一直占着 temp 到该群下一次
+        只靠 /补传 惰性检查的话，抓完不传的批次会一直占着 temp 到该群下一次
         指令；每次指令入口都扫一遍，过期批次活不过 TTL 太久。keep 传群号时跳过
         该群：_grab 正在给这个群换新批次，旧批次要等新图落盘后才作废。
         """
@@ -208,6 +220,22 @@ class WeiboAlbumPlugin(Star):
             self.logger.warning(f"[weibo_album] 配置项 {key} 不可用，按 {default} 处理")
             return default
 
+    async def _group_of(self, event: AstrMessageEvent) -> str:
+        """群号；非群聊直接回提示（返回空串由调用方收场）。"""
+        gid = str(event.get_group_id() or "")
+        if not gid:
+            await self._reply(event, "请在群聊里使用本插件，群相册需要群号")
+        return gid
+
+    async def _locked(self, event: AstrMessageEvent, gid: str, run) -> None:
+        """按群互斥地跑 run()。本群已在处理就直接回提示，不排队。"""
+        lock = self._locks.setdefault(gid, asyncio.Lock())
+        if lock.locked():
+            await self._reply(event, "本群已有一批图正在处理，请等它结束后再试")
+            return
+        async with lock:
+            await run()
+
     @staticmethod
     def _find_reply(event: AstrMessageEvent):
         """从消息链里找引用段。
@@ -223,8 +251,24 @@ class WeiboAlbumPlugin(Star):
                 return seg
         return None
 
+    async def _link_from_args(
+        self, event: AstrMessageEvent, text: str
+    ) -> tuple[str, str]:
+        """指令参数 -> (抓取目标文本, 相册名)。
+
+        参数里没链接/ID 而消息带引用时，目标从被引用的分享消息/卡片里提取，
+        参数当作相册名——QQ 回复自动带的 "@昵称(uin)" 段会被适配器拼进命令参数，
+        与 "/传图 <链接> <相册名>" 的写法对齐，一步到位。
+        """
+        link_text, want = split_album(text)
+        reply = self._find_reply(event)
+        if reply is not None and not has_share_target(link_text):
+            want = want or link_text.strip()
+            link_text = await self._quote_target(event, reply)
+        return link_text, want
+
     async def _quote_target(self, event: AstrMessageEvent, reply) -> str:
-        """从被引用消息里提取微博目标（链接 / 口令 bid）。
+        """从被引用消息里提取抓取目标（微博或小红书链接 / 口令 bid）。
 
         AstrBot 的 aiocqhttp 适配器收到引用消息时已经调过 get_msg，把被引用消息
         转好的组件放在 Reply.chain 里（小程序卡片是 Json 组件，data 已是 dict），
@@ -279,14 +323,16 @@ class WeiboAlbumPlugin(Star):
                                 parts.append(val)
                 elif isinstance(msg, str):
                     parts.append(msg)
-        hit = target_from_share(*[p for p in parts if p is not None])
+        hit = xhs_target_from_share(*[p for p in parts if p is not None])
+        if not hit:
+            hit = target_from_share(*[p for p in parts if p is not None])
         if not hit:
             self.logger.info(
-                f"[weibo_album] 引用消息 id={reply.id} 里没认出微博目标，"
+                f"[weibo_album] 引用消息 id={reply.id} 里没认出微博/小红书目标，"
                 f"候选段概要: {[p if isinstance(p, str) else type(p).__name__ for p in parts]}"
             )
             raise WeiboError(
-                "被引用的消息里没有识别到微博链接或小程序卡片，"
+                "被引用的消息里没有识别到微博或小红书链接（含小程序卡片），"
                 "也可以直接把链接跟在指令后面发"
             )
         return hit
@@ -315,6 +361,34 @@ class WeiboAlbumPlugin(Star):
             self._wb_sig = sig
         return self._wb
 
+    async def _xhs_client(self) -> XHSClient:
+        s = await self._get_session()
+        sig = (
+            self.config.get("xhs_cookie", ""),
+            self._num("request_timeout", 25),
+            self.config.get("proxy", ""),
+        )
+        if self._xhs is None or self._xhs.s is not s or self._xhs_sig != sig:
+            self._xhs = XHSClient(s, cookie=sig[0], timeout=sig[1], proxy=sig[2])
+            self._xhs_sig = sig
+        return self._xhs
+
+    @staticmethod
+    def _route(text: str) -> tuple[str, str]:
+        """按链接文本决定走哪个平台：返回 (平台, 目标文本)。小红书优先判定。"""
+        if has_xhs_target(text):
+            return "xhs", text
+        return "weibo", text
+
+    async def _grab_posts(self, text: str) -> tuple[WeiboClient | XHSClient, list]:
+        """按平台路由到对应客户端，返回 (客户端, Post 列表)。下载阶段还要用同一客户端。"""
+        platform, target = self._route(text)
+        if platform == "xhs":
+            xhs = await self._xhs_client()
+            return xhs, await xhs.grab(target)
+        wb = await self._weibo()
+        return wb, await wb.grab(target, max_pages=self._num("max_pages", 3))
+
     async def _album_client(self, event: AstrMessageEvent) -> NapCatAlbum:
         if not isinstance(event, AiocqhttpMessageEvent):
             raise NapCatError(
@@ -332,41 +406,6 @@ class WeiboAlbumPlugin(Star):
             return await bot.call_action(action, **params)
 
         return NapCatAlbum(caller, preferred=self.payload, same_host=self.same_host)
-
-    async def _default_album(self, gid: str) -> dict:
-        """本群的默认相册：绑定（KV）优先，其次配置里的 default_album；{} 表示都没有。
-
-        绑定新版存 {"id", "name"}——QQ 侧把相册改名后仍能按 ID 命中；旧版存的是纯
-        相册名字符串，读出来原样兼容。
-        """
-        raw = await self.get_kv_data(f"album:{gid}", "") or ""
-        if isinstance(raw, dict):
-            out = {"id": str(raw.get("id") or ""), "name": str(raw.get("name") or "")}
-            bound = {k: v for k, v in out.items() if v}
-            if bound:
-                return bound
-        elif str(raw).strip():
-            return {"name": str(raw)}
-        cfg = str(self.config.get("default_album", "") or "").strip()
-        return {"name": cfg} if cfg else {}
-
-    async def _resolve_album(
-        self, nc: NapCatAlbum, gid: str, want: str
-    ) -> tuple[str, str]:
-        if not want:
-            d = await self._default_album(gid)
-            if d.get("id"):
-                try:
-                    return await nc.resolve_album(
-                        gid, d["id"], default_name=d.get("name", "")
-                    )
-                except NapCatError:
-                    if d.get("name"):
-                        # 绑定的相册可能已被删：按名字再找一次，报错也能带上相册清单
-                        return await nc.resolve_album(gid, d["name"])
-                    raise
-            want = d.get("name", "")
-        return await nc.resolve_album(gid, want)
 
     async def _existing_names(self, nc: NapCatAlbum, gid: str, album_id: str) -> str:
         """相册里已有媒体的文件名合集；读不到就返回空串（去重只是优化，不能成为故障点）。"""
@@ -390,43 +429,34 @@ class WeiboAlbumPlugin(Star):
 
     # ---------- 指令 ----------
 
-    @filter.command("微博相册", alias={"微博传图", "wbalbum"})
+    # 指令按功能命名（动词开头），不含平台词、不带别名：发什么链接就按链接
+    # 特征自动路由（_route），微博/小红书不需要用户区分。
+    @filter.command("传图")
     async def grab_to_album(self, event: AstrMessageEvent, text: GreedyStr):
-        """抓取微博全部原图传进群相册：/微博相册 <链接> [| 相册名]。也可引用微博小程序卡片/分享消息后发 /微博相册 [相册名]"""
+        """抓取微博/小红书链接里的全部图片传进群相册：/传图 <链接> [| 相册名]，平台自动识别。也可引用分享消息/卡片后发 /传图 [相册名]"""
+        await self._enter_grab(event, text)
+
+    async def _enter_grab(self, event: AstrMessageEvent, text: str) -> None:
         # 先接管事件，免得链接解析类插件把同一批图再往群里刷一遍
         event.stop_event()
-        gid = str(event.get_group_id() or "")
-        if not gid:
-            await self._reply(event, "请在群聊里使用本插件，群相册需要群号")
-            return
-        lock = self._locks.setdefault(gid, asyncio.Lock())
-        if lock.locked():
-            await self._reply(event, "本群已有一批图正在处理，请等它结束后再试")
-            return
-        async with lock:
-            await self._grab(event, gid, text)
+        gid = await self._group_of(event)
+        if gid:
+            await self._locked(event, gid, lambda: self._grab(event, gid, text))
 
-    @filter.command("传相册", alias={"上传相册", "wbpush"})
+    @filter.command("补传")
     async def push_album(self, event: AstrMessageEvent, text: GreedyStr):
-        """把暂存的那批图传进指定相册：/传相册 <编号或相册名>，不带参数用绑定的默认相册"""
+        """把暂存的那批图传进指定相册：/补传 <编号或相册名>；不带参数传回这批图上次的目标相册（失败重传）"""
         event.stop_event()
-        gid = str(event.get_group_id() or "")
-        if not gid:
-            await self._reply(event, "请在群聊里使用本插件，群相册需要群号")
-            return
-        lock = self._locks.setdefault(gid, asyncio.Lock())
-        if lock.locked():
-            await self._reply(event, "本群已有一批图正在处理，请等它结束后再试")
-            return
-        async with lock:
-            await self._push(event, gid, text)
+        gid = await self._group_of(event)
+        if gid:
+            await self._locked(event, gid, lambda: self._push(event, gid, text))
 
     async def _push(self, event: AstrMessageEvent, gid: str, want: str) -> None:
         # 顺手把别的群过期的暂存批次清掉；本群过期的清完后走下面的"没有待上传"
         self._sweep_pending()
         job = self._pending.get(gid)
         if not job:
-            await self._reply(event, "没有待上传的图了，先 /微博相册 <链接> 抓一批")
+            await self._reply(event, "没有待上传的图了，先 /传图 <链接> 抓一批")
             return
         want = (want or "").strip()
         try:
@@ -434,19 +464,21 @@ class WeiboAlbumPlugin(Star):
             nums = job["albums"]
             if want.isdigit() and 1 <= int(want) <= len(nums):
                 album = nums[int(want) - 1]
-            elif not want and not await self._default_album(gid):
-                if nums:
-                    await self._reply(
-                        event,
-                        "本群没绑定默认相册，请发 /传相册 <编号或相册名>，"
-                        "相册见上一条消息里的列表",
-                    )
-                else:
-                    # 一步到位（带相册名抓取）失败转来的批次没带相册列表，现场补列一次
-                    await self._ask_album(event, nc, gid, job["files"], "")
-                return
+            elif not want:
+                # 裸 /补传：回到这批图上次的目标相册（一步到位抓取失败转来的重传）
+                album = job.get("album")
+                if not album:
+                    if nums:
+                        await self._reply(
+                            event,
+                            "请发 /补传 <编号或相册名>，相册见上一条消息里的列表",
+                        )
+                    else:
+                        # 一步到位批次没带相册列表，现场补列一次
+                        await self._ask_album(event, nc, gid, job["files"], "")
+                    return
             else:
-                album = await self._resolve_album(nc, gid, want)
+                album = await nc.resolve_album(gid, want)
             await self._upload(event, nc, gid, album, job["files"])
         except (WeiboError, NapCatError) as e:
             await self._reply(event, f"失败：{e}")
@@ -455,20 +487,11 @@ class WeiboAlbumPlugin(Star):
             await self._reply(event, f"出错了：{e}")
 
     async def _grab(self, event: AstrMessageEvent, gid: str, text: str) -> None:
-        link_text, want = split_album(text)
         try:
-            # 引用（回复）一条微博分享/小程序卡片也能发起。QQ 回复会自动带上
-            # 被引用者的 @ 段，"@昵称(uin)" 会被适配器拼进命令参数——参数里
-            # 没有可识别的链接/ID 时就当作相册名（与 "/微博相册 <链接> <相册名>"
-            # 的写法对齐），目标从引用里提取，一步到位
-            reply = self._find_reply(event)
-            if reply is not None and not has_share_target(link_text):
-                want = want or link_text.strip()
-                link_text = await self._quote_target(event, reply)
-            wb = await self._weibo()
-            # 平台不对就直说，别白抓一轮微博才发现调不到相册接口
+            link_text, want = await self._link_from_args(event, text)
+            # 平台不对就直说，别白抓一轮才发现调不到相册接口
             nc = await self._album_client(event)
-            posts = await wb.grab(link_text, max_pages=self._num("max_pages", 3))
+            client, posts = await self._grab_posts(link_text)
             images = self._collect(posts)
             # 视频条目不进上传列表：群相册接口只有图片上传（NapCat 未实现视频）
             video_n = sum(1 for im in images if im.kind == "video")
@@ -477,10 +500,10 @@ class WeiboAlbumPlugin(Star):
                 if video_n:
                     await self._reply(
                         event,
-                        "这条微博里只有视频，没有可上传的图片（群相册接口仅支持图片）",
+                        "这条内容是视频，没有可上传的图片（群相册接口仅支持图片）",
                     )
                 else:
-                    await self._reply(event, "这条微博里没有抓到图片")
+                    await self._reply(event, "这条内容里没有抓到图片")
                 return
             limit = max(1, self._num("max_images", 30))
             note = ""
@@ -491,7 +514,7 @@ class WeiboAlbumPlugin(Star):
             # 别的群过期的暂存批次顺手清；本群旧批次要等新图落盘后才作废
             self._sweep_pending(keep=gid)
             folder = self._job_dir(gid, posts)
-            files, fails = await self._download_all(wb, images, folder)
+            files, fails = await self._download_all(client, images, folder)
             if not files:
                 shutil.rmtree(folder, ignore_errors=True)
                 await self._reply(
@@ -500,7 +523,7 @@ class WeiboAlbumPlugin(Star):
                 )
                 return
             # 新批次已经落盘，上次"待选相册"放下的那批才算作废：万一这次抓取或
-            # 下载全挂了，用户原本还能 /传相册 的旧批次不能先被毁掉
+            # 下载全挂了，用户原本还能 /补传 的旧批次不能先被毁掉
             old = self._pending.pop(gid, None)
             if old and old["files"]:
                 old_dir = old["files"][0][1].parent
@@ -515,10 +538,10 @@ class WeiboAlbumPlugin(Star):
             if video_n:
                 head += f"\n另有 {video_n} 个视频未上传（群相册接口仅支持图片）"
             if want:
-                # 一步到位也要登记 pending：失败的那几张 /传相册 才有得重传
+                # 一步到位也要登记 pending：失败的那几张 /补传 才有得重传
                 self._pending[gid] = {"files": files, "albums": [], "ts": time.time()}
                 try:
-                    album = await self._resolve_album(nc, gid, want)
+                    album = await nc.resolve_album(gid, want)
                 except NapCatError as e:
                     # 相册名写错了也别把已经下好的图丢掉，直接转成"现选一个"
                     await self._ask_album(event, nc, gid, files, f"{head}\n{e}")
@@ -527,7 +550,7 @@ class WeiboAlbumPlugin(Star):
                 await self._upload(event, nc, gid, album, files)
             else:
                 await self._ask_album(event, nc, gid, files, head)
-        except (WeiboError, NapCatError) as e:
+        except _GRAB_ERRORS as e:
             await self._reply(event, f"失败：{e}")
         except Exception as e:
             self.logger.exception("[weibo_album] 未预期错误")
@@ -581,13 +604,13 @@ class WeiboAlbumPlugin(Star):
         return proc.returncode == 0 and await asyncio.to_thread(_gif_ok)
 
     async def _download_all(
-        self, wb: WeiboClient, images: list[Image], folder: Path
+        self, client: WeiboClient | XHSClient, images: list[Image], folder: Path
     ) -> tuple[list[tuple[Image, Path]], list[str]]:
         """整批并发下载到本地目录。
 
         下载可以并发，相册上传不行（QQ 侧频控 + 要按顺序回报新增数），所以两阶段拆开：
         先并发把图全落到本地，再一张一张传，任何一环失败都不会让已经抓到的图重下一遍。
-        live 图优先下载视频段转 GIF，转不动回落封面静图。
+        live 图优先下载视频段转 GIF，转不动回落封面静图（微博专属，小红书图都是静图）。
         """
         sem = asyncio.Semaphore(PREFETCH)
         want_gif = bool(self.config.get("live_gif", True)) and bool(self._ffmpeg)
@@ -595,14 +618,14 @@ class WeiboAlbumPlugin(Star):
         async def one(im: Image) -> tuple[Path | None, str]:
             async with sem:
                 if im.kind == "live" and want_gif and im.video_url:
-                    gif = await self._live_gif(wb, im, folder)
+                    gif = await self._live_gif(client, im, folder)
                     if gif is not None:
                         return gif, ""
                 try:
-                    data = await wb.download(im)
-                except WeiboError as e:
+                    data = await client.download(im)
+                except _GRAB_ERRORS as e:
                     return None, f"{_mark(im)}：{e}"
-                # ext 来自微博接口，拼进文件名前收一下，别让怪字符混进路径
+                # ext 来自平台接口或文件头探测，拼进文件名前收一下，别让怪字符混进路径
                 ext = re.sub(r"[^0-9a-z]", "", (im.ext or "jpg").lower())[:5] or "jpg"
                 path = folder / f"{_stem(im)}.{ext}"
                 try:
@@ -617,8 +640,11 @@ class WeiboAlbumPlugin(Star):
         fails = [msg for _, msg in results if msg]
         return files, fails
 
-    async def _live_gif(self, wb: WeiboClient, im: Image, folder: Path) -> Path | None:
-        """下载 live 图的视频段并转 GIF；任何一步失败返回 None，由上层回落封面。"""
+    async def _live_gif(self, wb, im: Image, folder: Path) -> Path | None:
+        """下载 live 图的视频段并转 GIF；任何一步失败返回 None，由上层回落封面。
+
+        只有微博 live 图会走到这（kind=="live"），传入的 client 必是 WeiboClient。
+        """
         stem = folder / _stem(im)
         mp4, gif = stem.with_suffix(".mp4"), stem.with_suffix(".gif")
         try:
@@ -635,9 +661,9 @@ class WeiboAlbumPlugin(Star):
     async def _ask_album(
         self, event: AstrMessageEvent, nc: NapCatAlbum, gid: str, files, head: str
     ) -> None:
-        """没写相册名就不猜：把相册列出来让用户这一次挑，绑定的那个只作为默认候选。
+        """没写相册名就不猜：把相册列出来让用户这一次挑。
 
-        pending 先登记再拉列表：列表拉挂了批次也还在，/传相册 <相册名> 仍可重试，
+        pending 先登记再拉列表：列表拉挂了批次也还在，/补传 <相册名> 仍可重试，
         不会变成没人引用的孤儿文件。
         """
         job = {"files": files, "albums": [], "ts": time.time()}
@@ -653,19 +679,16 @@ class WeiboAlbumPlugin(Star):
                 f"{head}\n这个群还没有相册（或机器人没权限），请先在 QQ 里建一个相册",
             )
             return
-        default = (await self._default_album(gid)).get("name", "")
         shown = job["albums"][:MAX_ALBUM_CHOICES]
         lines = [f"{i + 1}. {name}" for i, (_, name) in enumerate(shown)]
         if len(job["albums"]) > len(shown):
             lines.append(f"…共 {len(job['albums'])} 个，没列出的直接写相册名")
         tip = f"{PENDING_TTL // 60} 分钟内有效"
-        if default:
-            tip = f"只发 /传相册 就传到「{default}」；{tip}"
         await self._reply(
             event,
             f"{head}\n传到哪个相册？\n"
             + "\n".join(lines)
-            + f"\n/传相册 <编号或相册名>（{tip}）",
+            + f"\n/补传 <编号或相册名>（{tip}）",
         )
 
     @staticmethod
@@ -719,6 +742,10 @@ class WeiboAlbumPlugin(Star):
     ) -> None:
         album_id, album_name = album
         folder = files[0][1].parent
+        job = self._pending.get(gid)
+        if job is not None and job["files"] is files:
+            # 记住这批图的目的地：失败重传时裸 /补传 直接回到这个相册
+            job["album"] = album
         conc = max(1, self._num("upload_concurrency", UPLOAD_CONC))
         interval = self._num("upload_interval", 0.5, float)
         existing = ""
@@ -756,7 +783,7 @@ class WeiboAlbumPlugin(Star):
                 try:
                     mode = await nc.upload_file(gid, album_id, album_name, path)
                 except (NapCatError, OSError) as e:
-                    # 失败的那张留在本地，/传相册 可以直接重传，不用重新抓
+                    # 失败的那张留在本地，/补传 可以直接重传，不用重新抓
                     self.logger.warning(f"[weibo_album] 上传失败 {im.url}: {e}")
                     return None, f"{_mark(im)}：{e}"
                 if interval:
@@ -812,14 +839,12 @@ class WeiboAlbumPlugin(Star):
         except OSError:
             pass
         if ok and not fails:
-            # 整批都处理完了才撤掉待上传登记；还留着失败张的话，/传相册 重传全靠它
+            # 整批都处理完了才撤掉待上传登记；还留着失败张的话，/补传 重传全靠它
             self._pending.pop(gid, None)
-        else:
-            job = self._pending.get(gid)
-            if job is not None and job["files"] is files:
-                # 成功张已经删了，pending 里只留失败张：不然 skip_exists 关掉时
-                # 重传会对着不存在的文件报错，pending 到过期都清不掉
-                job["files"] = fail_pairs
+        elif job is not None and job["files"] is files:
+            # 成功张已经删了，pending 里只留失败张：不然 skip_exists 关掉时
+            # 重传会对着不存在的文件报错，pending 到过期都清不掉
+            job["files"] = fail_pairs
         if nc.same_host and modes:
             learned = modes.most_common(1)[0][0]
             if learned != self.payload:
@@ -827,7 +852,7 @@ class WeiboAlbumPlugin(Star):
                 self.payload = learned
                 await self.put_kv_data(PAYLOAD_KEY, learned)
 
-        # 完成回复只报结果：状态 + 成功张数；失败时附明细，好让 /传相册 补传
+        # 完成回复只报结果：状态 + 成功张数；失败时附明细，好让 /补传 补传
         state = "上传未完成" if fails else "上传完成"
         msg = f"{state}：成功 {ok}/{len(todo)} 张 -> 相册「{album_name}」"
         if dup:
@@ -836,45 +861,50 @@ class WeiboAlbumPlugin(Star):
             msg += "\n失败明细：\n" + "\n".join(fails[:5])
             if len(fails) > 5:
                 msg += f"\n…另有 {len(fails) - 5} 张失败"
-            msg += "\n失败的还在，30 分钟内发 /传相册 可只重传那几张"
+            msg += "\n失败的还在，30 分钟内发 /补传 可只重传那几张（仍传到本相册）"
         await self._reply(event, msg)
 
-    @filter.command("微博图片", alias={"微博预览", "wbimg"})
+    @filter.command("看图")
     async def preview(self, event: AstrMessageEvent, text: GreedyStr):
-        """只看微博里有哪些原图，不下载不上传：/微博图片 <链接>，也可引用微博卡片/分享消息发"""
+        """只看微博/小红书链接里有哪些图片，不下载不上传：/看图 <链接>，平台自动识别，也可引用分享消息/卡片发"""
+        await self._preview(event, text)
+
+    async def _preview(self, event: AstrMessageEvent, text: str) -> None:
         event.stop_event()
         try:
-            wb = await self._weibo()
-            link_text, _ = split_album(text)
-            reply = self._find_reply(event)
-            if reply is not None and not has_share_target(link_text):
-                link_text = await self._quote_target(event, reply)
-            posts = await wb.grab(link_text, max_pages=self._num("max_pages", 3))
-            n = sum(1 for p in posts for im in p.images if im.kind != "video")
-            if not n:
-                await self._reply(event, "没有抓到图片")
-                return
-            lines = [
-                f"{p.author}：{sum(1 for im in p.images if im.kind != 'video')} 张"
-                for p in posts
-                if any(im.kind != "video" for im in p.images)
+            link_text, _ = await self._link_from_args(event, text)
+            _, posts = await self._grab_posts(link_text)
+            # 视频条目（含视频笔记的封面）不算可传图
+            per_post = [
+                (p, sum(1 for im in p.images if im.kind != "video")) for p in posts
             ]
-            first = next(p for p in posts if p.images)
-            lines.append(f"首图：{first.images[0].url}")
+            if not sum(c for _, c in per_post):
+                if any(p.kind == "video" for p in posts):
+                    await self._reply(
+                        event,
+                        "这条内容是视频，没有可上传的图集（群相册接口仅支持图片）",
+                    )
+                else:
+                    await self._reply(event, "没有抓到图片")
+                return
+            lines = [f"{p.author}：{c} 张" for p, c in per_post if c]
+            first = next(
+                im for p, c in per_post if c for im in p.images if im.kind != "video"
+            )
+            lines.append(f"首图：{first.url}")
             await self._reply(event, "\n".join(lines))
-        except WeiboError as e:
+        except _GRAB_ERRORS as e:
             await self._reply(event, f"失败：{e}")
         except Exception as e:
             self.logger.exception("[weibo_album] 未预期错误")
             await self._reply(event, f"出错了：{e}")
 
-    @filter.command("群相册列表", alias={"相册列表"})
+    @filter.command("列相册")
     async def list_albums(self, event: AstrMessageEvent):
         """查看本群有哪些相册以及各自 ID。"""
         event.stop_event()
-        gid = str(event.get_group_id() or "")
+        gid = await self._group_of(event)
         if not gid:
-            await self._reply(event, "请在群聊里使用本插件，群相册需要群号")
             return
         try:
             nc = await self._album_client(event)
@@ -892,45 +922,3 @@ class WeiboAlbumPlugin(Star):
         except Exception as e:
             self.logger.exception("[weibo_album] 未预期错误")
             await self._reply(event, f"出错了：{e}")
-
-    @filter.command("绑定相册")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def bind_album(self, event: AstrMessageEvent, text: GreedyStr):
-        """绑定本群默认相册（AstrBot 管理员，即 WebUI 里配置的管理员账号，非 QQ 群管理员）：/绑定相册 <相册名>。不绑定也行，每次传的时候现选。"""
-        event.stop_event()
-        gid = str(event.get_group_id() or "")
-        if not gid:
-            await self._reply(event, "请在群聊里使用本插件，群相册需要群号")
-            return
-        want = (text or "").strip()
-        if not want:
-            await self._reply(event, "用法：/绑定相册 <相册名>")
-            return
-        try:
-            nc = await self._album_client(event)
-            album_id, album_name = await nc.resolve_album(gid, want)
-            # 存 ID 而不是名字：QQ 侧把相册改名后按 ID 仍能命中，名字留作兜底
-            await self.put_kv_data(f"album:{gid}", {"id": album_id, "name": album_name})
-            await self._reply(event, f"已绑定默认相册「{album_name}」({album_id})")
-        except NapCatError as e:
-            await self._reply(event, f"失败：{e}")
-        except Exception as e:
-            self.logger.exception("[weibo_album] 未预期错误")
-            await self._reply(event, f"出错了：{e}")
-
-    @filter.command("解绑相册")
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def unbind_album(self, event: AstrMessageEvent):
-        """解除本群默认相册绑定（AstrBot 管理员，即 WebUI 里配置的管理员账号，非 QQ 群管理员）。"""
-        event.stop_event()
-        gid = str(event.get_group_id() or "")
-        if not gid:
-            await self._reply(event, "请在群聊里使用本插件，群相册需要群号")
-            return
-        try:
-            await self.delete_kv_data(f"album:{gid}")
-        except Exception as e:
-            self.logger.exception("[weibo_album] 未预期错误")
-            await self._reply(event, f"出错了：{e}")
-            return
-        await self._reply(event, "已解绑，之后按插件配置里的默认相册走")
