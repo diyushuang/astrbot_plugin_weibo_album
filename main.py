@@ -34,7 +34,6 @@ try:
 except ImportError:
     get_astrbot_data_path = None
 
-from .img_compress import PILImage, recompress_image
 from .napcat_album import (
     ALBUM_LIST_ITEM_ID_KEYS,
     ALBUM_LIST_ITEM_NAME_KEYS,
@@ -62,10 +61,7 @@ _GRAB_ERRORS = (WeiboError, XhsError, NapCatError)
 
 PREFETCH = 5  # 下载并发度：整批先落到本地，之后才传相册
 UPLOAD_CONC = 3  # 同时在传的张数。 NapCat 每张图内部要串行发几十个 16KB 分片，串行太慢
-CPU_HEAVY = 2  # ffmpeg 转码 / Pillow 重压这类重 CPU 活的全局并发上限，防小机器被打满
-COMPRESS_OVER_MB = 8  # 超过该体积的原图上传前重压成 JPEG（0 关闭）
-COMPRESS_LONG_SIDE = 5000  # 重压时长边上限：相册浏览用不到比这更大的分辨率
-COMPRESS_QUALITY = 85  # JPEG 质量：观感与原图无异，体积差一个数量级
+CPU_HEAVY = 2  # ffmpeg 转码这类重 CPU 活的全局并发上限，防小机器被打满
 UPLOAD_PAYLOAD_MB = (
     32  # 全群同时在途的上传载荷总量预算（MB，0 关闭）：小内存服务器的硬顶
 )
@@ -165,10 +161,9 @@ class WeiboAlbumPlugin(Star):
         self._up_sem = asyncio.Semaphore(UPLOAD_CONC)
         self._up_conc = UPLOAD_CONC  # _up_sem 建立时的并发配置，热改配置后重建
         self._cpu_sem = asyncio.Semaphore(CPU_HEAVY)
-        self._compress_warned = False  # 配了重压但没装 Pillow 时只警告一次
-        # 上传载荷字节闸：张数并发挡不住"单张特别大"的图——Pillow 缺失或没压到
-        # 阈值以下时，几张 20MB 级原图的 base64 载荷就能同时吃掉几百 MB（插件侧
-        # 和 NapCat 侧各算一遍）。按在途字节总量排队，给内存一个真正的硬顶。
+        # 上传载荷字节闸：张数并发挡不住"单张特别大"的图——几张 20MB 级原图的
+        # base64 载荷就能同时吃掉几百 MB（插件侧和 NapCat 侧各算一遍）。按在途
+        # 字节总量排队，给内存一个真正的硬顶。
         self._up_bytes = 0
         self._up_bytes_cond = asyncio.Condition()
         self.payload = ""  # 同机探测过能用的载荷方式（path / base64）
@@ -207,20 +202,8 @@ class WeiboAlbumPlugin(Star):
         self._ffmpeg = shutil.which("ffmpeg") or ""
         if not self._ffmpeg:
             self.logger.info("[weibo_album] 未找到 ffmpeg，live 图将只上传封面静图")
-        if PILImage is None:
-            self.logger.warning(
-                "[weibo_album] 未安装 Pillow（pip install pillow），超大图重压"
-                "（compress_over_mb）不会生效，大图将按原图 base64 上传，"
-                "内存紧张的服务器请务必安装"
-            )
-        else:
-            self.logger.info(
-                "[weibo_album] Pillow 可用，超过 compress_over_mb 阈值的图将重压后上传"
-            )
         self._diag(
-            f"启动 Pillow={'有' if PILImage is not None else '无'} "
-            f"ffmpeg={'有' if self._ffmpeg else '无'} "
-            f"compress_over_mb={self._num('compress_over_mb', COMPRESS_OVER_MB)} "
+            f"启动 ffmpeg={'有' if self._ffmpeg else '无'} "
             f"upload_concurrency={self._num('upload_concurrency', UPLOAD_CONC)} "
             f"upload_payload_mb={self._num('upload_payload_mb', UPLOAD_PAYLOAD_MB, float)}"
         )
@@ -664,8 +647,8 @@ class WeiboAlbumPlugin(Star):
                     f"{len(images)} 张一张都没下载下来：\n" + "\n".join(fails[:5]),
                 )
                 return
-            # 批次体量进日志：日志里总大小异常大（几百 MB）说明 Pillow 重压没生效，
-            # 这是"传图把小服务器顶爆"最常见的原因，排查时先看这一行
+            # 批次体量进日志与诊断文件：死机排查时先看这一行，总大小异常大说明
+            # 那批原图本身就大，此时 upload_payload_mb 预算会把并发自动压到串行
             total_mb = await asyncio.to_thread(
                 lambda: sum(p.stat().st_size for _, p in files) / 1048576
             )
@@ -674,7 +657,6 @@ class WeiboAlbumPlugin(Star):
             )
             self._diag(
                 f"批次 {folder.name}：{len(files)} 张 {total_mb:.1f}MB "
-                f"重压={'on' if PILImage is not None else 'off(无Pillow)'} "
                 f"下载失败={len(fails)}"
             )
             # 新批次已经落盘，上次"待选相册"放下的那批才算作废：万一这次抓取或
@@ -810,49 +792,12 @@ class WeiboAlbumPlugin(Star):
                         pass  # 改不动就沿用预填的扩展名，不影响上传
                     else:
                         path = fixed
-                return await self._compress_if_huge(path), ""
+                return path, ""
 
         results = await asyncio.gather(*(one(im) for im in images))
         files = [(im, p) for im, (p, _) in zip(images, results, strict=True) if p]
         fails = [msg for _, msg in results if msg]
         return files, fails
-
-    async def _compress_if_huge(self, path: Path) -> Path:
-        """超过阈值的原图先重压成 JPEG 再进入暂存/上传流程，返回（可能改名的）路径。
-
-        内存峰值的最大来源就是它们：base64 载荷把整张图在进程里变成好几份拷贝，
-        还要乘上并发和群数，20MB 级原图一批下来小服务器直接进 swap。群相册场景
-        长边 5000、质量 85 的 JPEG 与原图观感无异，体积却差一个数量级。
-        没装 Pillow、关了配置或压缩失败时原样返回，绝不能因为压缩把上传挡死。
-        """
-        over = self._num("compress_over_mb", COMPRESS_OVER_MB)
-        if over <= 0:
-            return path
-        if PILImage is None:
-            if not self._compress_warned:
-                self._compress_warned = True
-                self.logger.warning(
-                    "[weibo_album] 配置了超大图重压但没装 Pillow（pip install pillow），"
-                    "这些图会按原图上传"
-                )
-            return path
-        try:
-            # 元数据 syscall 纳秒级，不值得过线程池
-            if path.stat().st_size <= over * 1048576:  # noqa: ASYNC240
-                return path
-        except OSError:
-            return path
-        if path.suffix.lower() == ".gif":
-            return path  # 动图压成 JPEG 会丢帧，live 图转出来的 GIF 一律不动
-        async with self._cpu_sem:
-            done = await asyncio.to_thread(
-                recompress_image, path, COMPRESS_LONG_SIDE, COMPRESS_QUALITY
-            )
-        if done:
-            self.logger.info(
-                f"[weibo_album] 超大图已重压: {path.name} -> {path.with_suffix('.jpg').name}"
-            )
-        return path.with_suffix(".jpg") if done else path
 
     async def _live_gif(self, wb, im: Image, folder: Path) -> Path | None:
         """下载 live 图的视频段并转 GIF；任何一步失败返回 None，由上层回落封面。
@@ -965,8 +910,8 @@ class WeiboAlbumPlugin(Star):
             self._up_sem = asyncio.Semaphore(conc)
             self._up_conc = conc
         interval = self._num("upload_interval", 0.5, float)
-        # 载荷字节预算（全群共享）：张数并发挡不住"单张特别大"的图，Pillow 缺失或
-        # 没压到阈值以下时按在途字节排队，相当于自动降低并发。0 = 关闭。
+        # 载荷字节预算（全群共享）：张数并发挡不住"单张特别大"的图，超大原图
+        # 的 base64 载荷按在途字节排队，相当于自动降低并发。0 = 关闭。
         budget_mb = self._num("upload_payload_mb", UPLOAD_PAYLOAD_MB, float)
         payload_budget = (
             float("inf") if budget_mb <= 0 else max(0.5, budget_mb) * 1048576

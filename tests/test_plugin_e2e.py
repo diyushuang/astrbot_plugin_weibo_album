@@ -406,7 +406,6 @@ def import_plugin():
         "weibo_client.py",
         "xhs_client.py",
         "napcat_album.py",
-        "img_compress.py",
         "metadata.yaml",
         "_conf_schema.json",
     )
