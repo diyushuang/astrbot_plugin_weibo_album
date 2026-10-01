@@ -2,10 +2,12 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import aiohttp
 
@@ -272,6 +274,7 @@ class WeiboClient:
         allow_redirects: bool = True,
         max_bytes: int = 0,
         in_bootstrap: bool = False,
+        sink: Path | None = None,
     ):
         last = None
         for attempt in range(RETRY_TIMES):
@@ -309,7 +312,10 @@ class WeiboClient:
                         for morsel in r.cookies.values():
                             if morsel.value and morsel.value != "deleted":
                                 self._ck[bucket][morsel.key] = morsel.value
-                        if max_bytes:
+                        if sink is not None and r.status == 200:
+                            # 指定了落盘目标且成功响应：边下边写文件，内存里只过 chunk
+                            body = await self._stream_to_sink(r, sink, max_bytes)
+                        elif max_bytes:
                             # 原图动辄十几 MB，边下边判，超限就别把整张图读进内存了
                             buf = bytearray()
                             async for chunk in r.content.iter_chunked(64 * 1024):
@@ -356,6 +362,34 @@ class WeiboClient:
                 f"请求失败 {url}（{last[1].decode('utf-8', 'replace')[:120]}）"
             )
         raise WeiboError(f"请求失败 {url} -> {last[0] if last else '?'}")
+
+    @staticmethod
+    async def _stream_to_sink(r, sink: Path, max_bytes: int) -> bytes:
+        """把 200 响应体流式写进 sink（同目录 .part 暂存，写完原子改名），返回空 bytes 占位。
+
+        下载不再把整张图攒在内存里：先 bytearray 累计再 bytes 拷贝的读法，单张峰值
+        2 倍体积，并发几路十几 MB 的原图就把进程内存顶上去了。64KB 的 chunk 写盘是
+        页缓存操作，直接在事件循环里写没有可感知的阻塞；中途任何异常（含取消、超限）
+        都把 .part 清掉，不会留下半截文件。
+        """
+        part = sink.with_name(sink.name + ".part")
+        written = 0
+        try:
+            # 同步 open/write 是有意的：64KB 的页缓存写亚毫秒级，逐 chunk 过线程池
+            # 只添乱；真要阻塞的整块写盘在调用方已经改为流式了
+            with open(part, "wb") as f:  # noqa: ASYNC230
+                async for chunk in r.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+                    written += len(chunk)
+                    if max_bytes and written > max_bytes:
+                        raise WeiboError(
+                            f"图片超过 {max_bytes // 1048576}MB 上限，已中止下载"
+                        )
+            os.replace(part, sink)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        return b""
 
     async def get_json(
         self, url: str, referer: str = "https://m.weibo.cn/", desktop: bool = False
@@ -673,6 +707,48 @@ class WeiboClient:
         if st != 200 or len(body) <= 1024:
             raise WeiboError(f"媒体下载失败 http {st} / {len(body)}B")
         return body
+
+    async def download_to(
+        self, img: Image, dest: Path, max_bytes: int = 30 * 1024 * 1024
+    ) -> str:
+        """流式下载图片到 dest（内存只驻留一个 chunk），返回扩展名。
+
+        download() 那种整张读进内存的写法，在整批并发时会把进程内存顶高；这版
+        边下边写。仍是先取 /large/ 原图，拿不到再退回接口给的地址。整体失败时
+        把落了一半的 dest 清掉，不留垃圾文件占着批次目录。
+        """
+        err = ""
+        for u in (img.url, img.alt_url):
+            if not u:
+                continue
+            try:
+                st, _, _ = await self._raw(
+                    u, referer="https://weibo.com/", max_bytes=max_bytes, sink=dest
+                )
+            except WeiboError as e:
+                err = str(e)
+                if "超过" in err:
+                    raise
+                continue
+            # 文件元数据查询是纳秒级 syscall，不值得过线程池
+            size = dest.stat().st_size if dest.is_file() else 0  # noqa: ASYNC240
+            if st == 200 and size > 1024:
+                return (img.ext or "jpg").lower()
+            err = f"http {st} / {size}B"
+        dest.unlink(missing_ok=True)  # noqa: ASYNC240
+        raise WeiboError(f"图片下载失败 {img.pid or img.url}：{err}")
+
+    async def download_media_to(
+        self, url: str, dest: Path, max_bytes: int = 30 * 1024 * 1024
+    ) -> None:
+        """流式下载媒体文件（live 图视频段）到 dest，ffmpeg 直接吃这个文件。"""
+        st, _, _ = await self._raw(
+            url, referer="https://weibo.com/", max_bytes=max_bytes, sink=dest
+        )
+        size = dest.stat().st_size if dest.is_file() else 0  # noqa: ASYNC240
+        if st != 200 or size <= 1024:
+            dest.unlink(missing_ok=True)  # noqa: ASYNC240
+            raise WeiboError(f"媒体下载失败 http {st} / {size}B")
 
     async def _longtext_images(self, mid: str) -> list[Image]:
         try:

@@ -8,9 +8,11 @@ imageView2 缩放参数请求原尺寸，CDN 不认再回落带参数版本。
 
 import asyncio
 import json
+import os
 import re
 import time
 import urllib.parse
+from pathlib import Path
 
 import aiohttp
 
@@ -263,11 +265,13 @@ class XHSClient:
         desktop: bool = True,
         referer: str = "https://www.xiaohongshu.com/",
         max_bytes: int = 0,
+        sink: Path | None = None,
     ) -> tuple[int, str, bytes]:
         """GET 一个地址（手动逐跳跟随重定向），返回 (状态码, 最终 URL, body)。
 
         重定向手动跟：aiohttp 自动跳转会原样转发 Cookie 头，短链若跳去外站
         登录态就带出去了。每跳重判域名，只有落点是小红书站域名才带 Cookie。
+        sink 给出且响应 200 时改为流式落盘（见 _stream_to_sink），body 返回空占位。
         """
         last: tuple[int, bytes] | None = None
         for attempt in range(RETRY_TIMES):
@@ -292,7 +296,9 @@ class XHSClient:
                                 current = urllib.parse.urljoin(str(r.url), loc)
                                 hop += 1
                                 continue
-                        if max_bytes:
+                        if sink is not None and r.status == 200:
+                            body = await self._stream_to_sink(r, sink, max_bytes)
+                        elif max_bytes:
                             buf = bytearray()
                             async for chunk in r.content.iter_chunked(64 * 1024):
                                 buf += chunk
@@ -320,6 +326,31 @@ class XHSClient:
                 f"请求失败 {url}（{last[1].decode('utf-8', 'replace')[:120]}）"
             )
         raise XhsError(f"请求失败 {url} -> {last[0] if last else '?'}")
+
+    @staticmethod
+    async def _stream_to_sink(r, sink: Path, max_bytes: int) -> bytes:
+        """把 200 响应体流式写进 sink（同目录 .part 暂存，写完原子改名），返回空 bytes 占位。
+
+        与 weibo_client 同款：下载不再把整张图攒在内存里，单张峰值从 2 倍体积降到
+        一个 chunk。中途任何异常（含取消、超限）都把 .part 清掉。
+        """
+        part = sink.with_name(sink.name + ".part")
+        written = 0
+        try:
+            # 同步 open/write 是有意的：64KB 的页缓存写亚毫秒级，逐 chunk 过线程池只添乱
+            with open(part, "wb") as f:  # noqa: ASYNC230
+                async for chunk in r.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+                    written += len(chunk)
+                    if max_bytes and written > max_bytes:
+                        raise XhsError(
+                            f"图片超过 {max_bytes // 1048576}MB 上限，已中止下载"
+                        )
+            os.replace(part, sink)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        return b""
 
     async def _get_html(self, url: str, desktop: bool) -> str:
         st, _, body = await self._raw(url, desktop=desktop, max_bytes=MAX_HTML_BYTES)
@@ -465,4 +496,44 @@ class XHSClient:
                 img.ext = sniff_ext(body) or img.ext
                 return body
             err = f"http {st} / {len(body)}B"
+        raise XhsError(f"图片下载失败 {img.pid or img.url}：{err}")
+
+    async def download_to(
+        self, img: Image, dest: Path, max_bytes: int = 30 * 1024 * 1024
+    ) -> str:
+        """流式下载到 dest（内存只驻留一个 chunk），返回按文件头认出的扩展名。
+
+        与 weibo_client 的 download_to 对齐：CDN 不认原图请求时仍逐个 URL 回落。
+        扩展名从已落盘文件的头 64 字节认（sniff_ext 需要读到 ftyp 盒后段），认不出
+        沿用 img.ext。整体失败时清掉落了一半的文件。
+        """
+        err = ""
+        for u in (img.url, img.alt_url):
+            if not u:
+                continue
+            try:
+                st, _, _ = await self._raw(
+                    u,
+                    desktop=False,
+                    referer="https://www.xiaohongshu.com/",
+                    max_bytes=max_bytes,
+                    sink=dest,
+                )
+            except XhsError as e:
+                err = str(e)
+                if "超过" in err:
+                    raise
+                continue
+            # 文件元数据查询与 64B 文件头读取都是纳秒/微秒级 syscall，不值得过线程池
+            size = dest.stat().st_size if dest.is_file() else 0  # noqa: ASYNC240
+            if st == 200 and size > 1024:
+                head = b""
+                try:
+                    with open(dest, "rb") as f:  # noqa: ASYNC230
+                        head = f.read(64)
+                except OSError:
+                    pass
+                return sniff_ext(head) or (img.ext or "jpg").lower()
+            err = f"http {st} / {size}B"
+        dest.unlink(missing_ok=True)  # noqa: ASYNC240
         raise XhsError(f"图片下载失败 {img.pid or img.url}：{err}")

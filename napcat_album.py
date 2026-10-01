@@ -428,7 +428,13 @@ class NapCatAlbum:
                     if not raw:
                         raise NapCatError("图片数据为空")
                 raw_b64 = await asyncio.to_thread(base64.b64encode, raw)
+                # 原始字节编码完就没用了：base64 载荷一路上要变成好几份内存拷贝
+                # （字节、字符串、aiocqhttp 的 JSON 序列化各一份），能早放一份是一份，
+                # 并发几路 20MB 级原图时这份省出来的就是小服务器的生死线。
+                # 同一批里换载荷重试的场合大不了再读一次盘。
+                raw = None
                 file = "base64://" + raw_b64.decode("ascii")
+                del raw_b64
             try:
                 await self.call(
                     "upload_image_to_qun_album",

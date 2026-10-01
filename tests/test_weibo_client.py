@@ -10,7 +10,9 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import aiohttp
 
@@ -555,12 +557,112 @@ async def share_extract_cases():
     )
 
 
+# ---------- download_to：流式落盘（内存只驻留 chunk） ----------
+
+
+async def download_to_cases():
+    class _Content:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        async def iter_chunked(self, n):
+            for c in self._chunks:
+                yield c
+
+    class _Resp:
+        def __init__(self, status, chunks):
+            self.status = status
+            self.url = "https://wx1.sinaimg.cn/large/pidXXXXXXXXXXXXXX.jpg"
+            self.cookies = {}
+            self.content = _Content(chunks)
+
+        async def read(self):
+            return b"".join(self._chunks)
+
+    class _Ctx:
+        def __init__(self, resp):
+            self._resp = resp
+
+        async def __aenter__(self):
+            return self._resp
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def __init__(self, resp):
+            self._resp = resp
+
+        def get(self, *a, **kw):
+            return _Ctx(self._resp)
+
+    # download_to 只认 >1024B 的响应为成功（与 download 的判据一致）
+    big = b"world" + b"z" * 2000
+    img = Image(url="https://wx1.sinaimg.cn/large/pidXXXXXXXXXXXXXX.jpg", ext="jpg")
+
+    with tempfile.TemporaryDirectory() as d:
+        dest = Path(d) / "pidXXXXXXXXXXXXXX.jpg"
+        c = WeiboClient(_Session(_Resp(200, [b"hello ", big])))
+        got = await c.download_to(img, dest)
+        assert got == "jpg"
+        assert dest.read_bytes() == b"hello " + big
+        assert not list(Path(d).glob("*.part")), "写完不能留 .part 暂存"
+    ok("download_to：分块流式落盘内容完整，不留 .part 残留，返回扩展名")
+
+    with tempfile.TemporaryDirectory() as d:
+        dest = Path(d) / "pidXXXXXXXXXXXXXX.jpg"
+        c = WeiboClient(_Session(_Resp(200, [b"x" * 100])))
+        try:
+            await c.download_to(img, dest, max_bytes=8)
+        except wc.WeiboError as e:
+            assert "超过" in str(e)
+        else:
+            raise AssertionError("超限该抛 WeiboError")
+        assert not dest.exists() and not list(Path(d).glob("*.part")), (
+            "超限中止后不能留半截文件"
+        )
+    ok("download_to：超过单张上限立刻中止，.part 清干净")
+
+    class _AltSession:
+        def __init__(self):
+            self.n = 0
+
+        def get(self, *a, **kw):
+            self.n += 1
+            return _Ctx(_Resp(200 if self.n > 1 else 500, [b"alt-" + big]))
+
+    img_alt = Image(
+        url="https://wx1.sinaimg.cn/large/pidYYYYYYYYYYYYYY.jpg",
+        alt_url="https://wx1.sinaimg.cn/large/pidYYYYYYYYYYYYYY_f.jpg",
+        ext="jpg",
+    )
+    with tempfile.TemporaryDirectory() as d:
+        dest = Path(d) / "p.jpg"
+        c = WeiboClient(_AltSession())
+        await c.download_to(img_alt, dest)
+        assert dest.read_bytes() == b"alt-" + big
+    ok("download_to：主地址非 200 时回落备用地址")
+
+    with tempfile.TemporaryDirectory() as d:
+        dest = Path(d) / "p.jpg"
+        c = WeiboClient(_Session(_Resp(500, [b"no"])))
+        try:
+            await c.download_to(img_alt, dest)
+        except wc.WeiboError:
+            pass
+        else:
+            raise AssertionError("主备全挂该抛 WeiboError")
+        assert not dest.exists(), "整体失败时把落了一半的文件清掉"
+    ok("download_to：主备全挂报错且不留垃圾文件")
+
+
 async def amain():
     await resolve_cases()
     await share_extract_cases()
     await bootstrap_no_selfwait()
     await net_error_message()
     await download_media_cases()
+    await download_to_cases()
     await resolve_default_name()
     await cookie_gate_and_redirect()
     await resolve_target_rejects_offsite()

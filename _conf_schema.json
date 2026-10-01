@@ -21,6 +21,12 @@
     "default": 30,
     "hint": "微博单条最多 18 张；抓取博主相册/超话时可调大"
   },
+  "compress_over_mb": {
+    "description": "超过多少 MB 的图上传前重压成 JPEG",
+    "type": "int",
+    "default": 8,
+    "hint": "内存保护：base64 上传会把整张图变成好几份内存拷贝，超大原图一批下来小服务器会扛不住。超过阈值的图压到长边 5000、质量 85 的 JPEG 再传（需 Pillow，缺了自动跳过照原图传）；群相册场景观感与原图无异。填 0 关闭"
+  },
   "max_pages": {
     "description": "抓取博主相册/时间线时的翻页数",
     "type": "int",

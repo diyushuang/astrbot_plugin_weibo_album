@@ -20,8 +20,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# 测试脚本：sys.path 操作后的本地导入、async 测试主体里的少量同步 open
-"tests/*" = ["E402", "ASYNC230"]
+# 测试脚本：sys.path 操作后的本地导入、async 测试主体里的少量同步文件操作
+"tests/*" = ["E402", "ASYNC230", "ASYNC240"]
 
 [tool.ruff.format]
 quote-style = "double"

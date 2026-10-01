@@ -11,6 +11,8 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -370,6 +372,39 @@ try:
 except XhsError as e:
     assert "下载失败" in str(e)
 ok("download：成功后按文件头修正 ext，主备地址全挂时报下载失败")
+
+
+# ---------- download_to：流式落盘，扩展名按文件头认 ----------
+
+PNG_PAYLOAD = b"\x89PNG\r\n\x1a\n" + b"0" * 2048
+
+
+async def fake_raw_png(url, **kw):
+    """按 _raw 的 sink 契约造假：200 时把内容写进 sink，返回空 body 占位。"""
+    sink = kw.get("sink")
+    if sink is not None:
+        part = sink.with_name(sink.name + ".part")
+        part.write_bytes(PNG_PAYLOAD)
+        part.replace(sink)
+    return (
+        200,
+        "https://ci.xiaohongshu.com/x",
+        b"" if sink is not None else PNG_PAYLOAD,
+    )
+
+
+c5 = XHSClient(None)
+c5._raw = fake_raw_png
+im5 = xc.Image(
+    url="https://ci.xiaohongshu.com/1040g2sg30png", pid="1040g2sg30png", ext="jpg"
+)
+with tempfile.TemporaryDirectory() as d:
+    dest = Path(d) / "x.jpg"
+    got = run(c5.download_to(im5, dest))
+    assert got == "png", got
+    assert dest.read_bytes() == PNG_PAYLOAD
+    assert not list(Path(d).glob("*.part"))
+ok("download_to：流式落盘后按文件头认出 png 并返回，内容完整无残留")
 
 
 print("\n全部通过")

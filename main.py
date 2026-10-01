@@ -26,6 +26,7 @@ try:
 except ImportError:  # 老版本 AstrBot 还没有 temp 路径，退回插件数据目录
     get_astrbot_temp_path = None
 
+from .img_compress import PILImage, recompress_image
 from .napcat_album import (
     ALBUM_LIST_ITEM_ID_KEYS,
     ALBUM_LIST_ITEM_NAME_KEYS,
@@ -53,6 +54,10 @@ _GRAB_ERRORS = (WeiboError, XhsError, NapCatError)
 
 PREFETCH = 5  # 下载并发度：整批先落到本地，之后才传相册
 UPLOAD_CONC = 3  # 同时在传的张数。 NapCat 每张图内部要串行发几十个 16KB 分片，串行太慢
+CPU_HEAVY = 2  # ffmpeg 转码 / Pillow 重压这类重 CPU 活的全局并发上限，防小机器被打满
+COMPRESS_OVER_MB = 8  # 超过该体积的原图上传前重压成 JPEG（0 关闭）
+COMPRESS_LONG_SIDE = 5000  # 重压时长边上限：相册浏览用不到比这更大的分辨率
+COMPRESS_QUALITY = 85  # JPEG 质量：观感与原图无异，体积差一个数量级
 PENDING_TTL = 1800  # 下载完等 /补传 选相册的存活时间
 LEDGER_TTL = 30 * 86400  # "本插件传过这张"的记录留多久
 LEDGER_MAX = 2000  # 每个相册最多记多少条
@@ -131,6 +136,14 @@ class WeiboAlbumPlugin(Star):
         )
         self._pending: dict[str, dict] = {}  # gid -> 下载完在等 /补传 指定相册的那批图
         self._inflight: set[asyncio.Task] = set()  # 在飞的上传任务，terminate 时要撤
+        # 并发闸挂在插件实例上全群共享：按群的锁只保证单群不叠加，两个群同时
+        # 各开一批时内存/CPU 峰值照样翻倍。总闸把"在途张数"钉死在与单群相同
+        # 的水位上，无论几个群同时触发、配置调多大，峰值都有一个硬顶。
+        self._dl_sem = asyncio.Semaphore(PREFETCH)
+        self._up_sem = asyncio.Semaphore(UPLOAD_CONC)
+        self._up_conc = UPLOAD_CONC  # _up_sem 建立时的并发配置，热改配置后重建
+        self._cpu_sem = asyncio.Semaphore(CPU_HEAVY)
+        self._compress_warned = False  # 配了重压但没装 Pillow 时只警告一次
         self.payload = ""  # 同机探测过能用的载荷方式（path / base64）
         self._ffmpeg = ""  # ffmpeg 可执行文件路径，initialize 时探测
         # 暂存根目录：优先 AstrBot 自带的 data/temp，本来就是放临时文件的地方，
@@ -576,27 +589,31 @@ class WeiboAlbumPlugin(Star):
 
     async def _to_gif(self, mp4: Path, gif: Path) -> bool:
         """live 图视频段转 GIF（限帧率压体积），失败返回 False 让上层回落封面。"""
-        proc = await asyncio.create_subprocess_exec(
-            self._ffmpeg,
-            "-y",
-            "-loglevel",
-            "error",
-            "-i",
-            str(mp4),
-            "-vf",
-            "fps=10,scale=480:-2:flags=lanczos",
-            "-loop",
-            "0",
-            str(gif),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=60)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return False
+        # CPU 总闸：ffmpeg 的 lanczos 缩放是实打实的满核负载，一批 live 图要是
+        # 跟着下载并发同时开 5 个 ffmpeg，小机器整个会被钉在 100% 上，机器人和
+        # NapCat 一起饿死。全群最多同时跑 CPU_HEAVY 个转码。
+        async with self._cpu_sem:
+            proc = await asyncio.create_subprocess_exec(
+                self._ffmpeg,
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(mp4),
+                "-vf",
+                "fps=10,scale=480:-2:flags=lanczos",
+                "-loop",
+                "0",
+                str(gif),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return False
 
         def _gif_ok() -> bool:
             return gif.is_file() and gif.stat().st_size > 0
@@ -611,8 +628,10 @@ class WeiboAlbumPlugin(Star):
         下载可以并发，相册上传不行（QQ 侧频控 + 要按顺序回报新增数），所以两阶段拆开：
         先并发把图全落到本地，再一张一张传，任何一环失败都不会让已经抓到的图重下一遍。
         live 图优先下载视频段转 GIF，转不动回落封面静图（微博专属，小红书图都是静图）。
+        信号量用全群共享的 _dl_sem：下载全程不再把整张图攒在内存里，但多个群同时
+        开批时在途连接数仍要有个总顶。
         """
-        sem = asyncio.Semaphore(PREFETCH)
+        sem = self._dl_sem
         want_gif = bool(self.config.get("live_gif", True)) and bool(self._ffmpeg)
 
         async def one(im: Image) -> tuple[Path | None, str]:
@@ -621,24 +640,63 @@ class WeiboAlbumPlugin(Star):
                     gif = await self._live_gif(client, im, folder)
                     if gif is not None:
                         return gif, ""
-                try:
-                    data = await client.download(im)
-                except _GRAB_ERRORS as e:
-                    return None, f"{_mark(im)}：{e}"
-                # ext 来自平台接口或文件头探测，拼进文件名前收一下，别让怪字符混进路径
                 ext = re.sub(r"[^0-9a-z]", "", (im.ext or "jpg").lower())[:5] or "jpg"
                 path = folder / f"{_stem(im)}.{ext}"
                 try:
-                    # 整张十几 MB 的写盘别卡事件循环
-                    await asyncio.to_thread(path.write_bytes, data)
+                    # 流式边下边写，十几 MB 的原图不再过一遍进程内存
+                    got = await client.download_to(im, path)
+                except _GRAB_ERRORS as e:
+                    return None, f"{_mark(im)}：{e}"
                 except OSError as e:
                     return None, f"{_mark(im)}：写本地文件失败 {e}"
-                return path, ""
+                if got and got != ext:
+                    # 小红书按文件头修正扩展名，改完名后续上传/清理拿到的才是真文件
+                    fixed = folder / f"{_stem(im)}.{got}"
+                    try:
+                        path.replace(fixed)
+                    except OSError:
+                        pass  # 改不动就沿用预填的扩展名，不影响上传
+                    else:
+                        path = fixed
+                return await self._compress_if_huge(path), ""
 
         results = await asyncio.gather(*(one(im) for im in images))
         files = [(im, p) for im, (p, _) in zip(images, results, strict=True) if p]
         fails = [msg for _, msg in results if msg]
         return files, fails
+
+    async def _compress_if_huge(self, path: Path) -> Path:
+        """超过阈值的原图先重压成 JPEG 再进入暂存/上传流程，返回（可能改名的）路径。
+
+        内存峰值的最大来源就是它们：base64 载荷把整张图在进程里变成好几份拷贝，
+        还要乘上并发和群数，20MB 级原图一批下来小服务器直接进 swap。群相册场景
+        长边 5000、质量 85 的 JPEG 与原图观感无异，体积却差一个数量级。
+        没装 Pillow、关了配置或压缩失败时原样返回，绝不能因为压缩把上传挡死。
+        """
+        over = self._num("compress_over_mb", COMPRESS_OVER_MB)
+        if over <= 0:
+            return path
+        if PILImage is None:
+            if not self._compress_warned:
+                self._compress_warned = True
+                self.logger.warning(
+                    "[weibo_album] 配置了超大图重压但没装 Pillow（pip install pillow），"
+                    "这些图会按原图上传"
+                )
+            return path
+        try:
+            # 元数据 syscall 纳秒级，不值得过线程池
+            if path.stat().st_size <= over * 1048576:  # noqa: ASYNC240
+                return path
+        except OSError:
+            return path
+        if path.suffix.lower() == ".gif":
+            return path  # 动图压成 JPEG 会丢帧，live 图转出来的 GIF 一律不动
+        async with self._cpu_sem:
+            done = await asyncio.to_thread(
+                recompress_image, path, COMPRESS_LONG_SIDE, COMPRESS_QUALITY
+            )
+        return path.with_suffix(".jpg") if done else path
 
     async def _live_gif(self, wb, im: Image, folder: Path) -> Path | None:
         """下载 live 图的视频段并转 GIF；任何一步失败返回 None，由上层回落封面。
@@ -648,8 +706,7 @@ class WeiboAlbumPlugin(Star):
         stem = folder / _stem(im)
         mp4, gif = stem.with_suffix(".mp4"), stem.with_suffix(".gif")
         try:
-            data = await wb.download_media(im.video_url)
-            await asyncio.to_thread(mp4.write_bytes, data)
+            await wb.download_media_to(im.video_url, mp4)
         except (WeiboError, OSError):
             return None
         if not await self._to_gif(mp4, gif):
@@ -747,6 +804,10 @@ class WeiboAlbumPlugin(Star):
             # 记住这批图的目的地：失败重传时裸 /补传 直接回到这个相册
             job["album"] = album
         conc = max(1, self._num("upload_concurrency", UPLOAD_CONC))
+        if conc != self._up_conc:
+            # WebUI 热改了并发配置：重建总闸。已在途的任务拿着旧信号量跑完本批，不追改
+            self._up_sem = asyncio.Semaphore(conc)
+            self._up_conc = conc
         interval = self._num("upload_interval", 0.5, float)
         existing = ""
         sent: set[str] = set()
@@ -776,7 +837,7 @@ class WeiboAlbumPlugin(Star):
         ok, fails, modes = 0, [], Counter()
         marks: list[str] = []
         done_files: list[Path] = []
-        sem = asyncio.Semaphore(conc)
+        sem = self._up_sem  # 全群共享的上传总闸，别的群同时在传时在这里排队
 
         async def push(im: Image, path: Path):
             async with sem:

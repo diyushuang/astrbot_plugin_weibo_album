@@ -391,6 +391,7 @@ def import_plugin():
         "weibo_client.py",
         "xhs_client.py",
         "napcat_album.py",
+        "img_compress.py",
         "metadata.yaml",
         "_conf_schema.json",
     )
@@ -435,16 +436,17 @@ def cache_network(module, store):
             posts_cache[key] = await orig_grab(self, text, max_pages=max_pages)
         return posts_cache[key]
 
-    async def download(self, img, max_bytes=30 * 1024 * 1024):
+    async def download_to(self, img, dest, max_bytes=30 * 1024 * 1024):
         if store.get("fail_downloads", 0) > 0:
             store["fail_downloads"] -= 1
             raise module.WeiboError("测试注入：下载失败")
         if img.url not in bytes_cache:
             bytes_cache[img.url] = await orig_dl(self, img, max_bytes=max_bytes)
-        return bytes_cache[img.url]
+        dest.write_bytes(bytes_cache[img.url])
+        return (img.ext or "jpg").lower()
 
     module.WeiboClient.grab = grab
-    module.WeiboClient.download = download
+    module.WeiboClient.download_to = download_to
 
 
 def file_parts(value):
@@ -1315,12 +1317,13 @@ async def main():
         async def xhs_grab(self, text):
             return [xhs_post]
 
-        async def xhs_download(self, img, max_bytes=30 * 1024 * 1024):
+        async def xhs_download_to(self, img, dest, max_bytes=30 * 1024 * 1024):
             img.ext = "png"
-            return FAKE_PNG
+            dest.write_bytes(FAKE_PNG)
+            return "png"
 
         module.XHSClient.grab = xhs_grab
-        module.XHSClient.download = xhs_download
+        module.XHSClient.download_to = xhs_download_to
         ev50 = make_event(XHS_NOTE_URL)
         await rt.dispatch(f"传图 {XHS_NOTE_URL} | 小红书好图", ev50)
         assert ev50.stopped, "统一指令同样要接管事件"
