@@ -11,6 +11,7 @@ import shutil
 import time
 import weakref
 from collections import Counter
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiohttp
@@ -58,6 +59,14 @@ CPU_HEAVY = 2  # ffmpeg 转码 / Pillow 重压这类重 CPU 活的全局并发�
 COMPRESS_OVER_MB = 8  # 超过该体积的原图上传前重压成 JPEG（0 关闭）
 COMPRESS_LONG_SIDE = 5000  # 重压时长边上限：相册浏览用不到比这更大的分辨率
 COMPRESS_QUALITY = 85  # JPEG 质量：观感与原图无异，体积差一个数量级
+# 传图进度的表情回应（QQ"贴表情"，NapCat 的 set_msg_emoji_like）：开始/收场这类
+# 过程性提示改贴表情，群里少刷两条机器人消息。emoji_id 用 QQ 小黄脸表情 ID，
+# 候选取自 astrbot_plugin_emoji_like 按情绪整理过的实战可用池；每个状态备几个
+# 语义相关的候选按序尝试，全贴不上（协议端太老没有这个接口）才回落成原文字。
+EMOJI_WORKING = (111, 353)  # 恳求：指令已受理，抓取/下载/上传进行中
+EMOJI_DONE = (4, 2, 28)  # 得意/开心：整批全部传完
+EMOJI_DUP = (100, 46)  # 尴尬/无语：整批都已传过，没有重复上传
+EMOJI_FAIL = (5, 11)  # 难过/生气：上传未完成（伴随失败明细文字）
 PENDING_TTL = 1800  # 下载完等 /补传 选相册的存活时间
 LEDGER_TTL = 30 * 86400  # "本插件传过这张"的记录留多久
 LEDGER_MAX = 2000  # 每个相册最多记多少条
@@ -225,6 +234,50 @@ class WeiboAlbumPlugin(Star):
         MessageEventResult 本身是 MessageChain 的子类，可以直接喂给 send()。
         """
         await event.send(event.plain_result(text))
+
+    async def _react(
+        self, event: AstrMessageEvent, emoji_ids: tuple[int, ...], add: bool = True
+    ) -> bool:
+        """在触发指令的那条消息上贴/撤一个表情回应。
+
+        走 NapCat 的 set_msg_emoji_like 扩展（与相册接口同一前提：消息来自
+        aiocqhttp 平台），emoji_id 是 QQ 小黄脸表情 ID，add=False 撤回。候选按
+        顺序试、贴上第一个就收手；全部贴不上（ID 不被回应面板接受、协议端太老
+        没有这个接口）返回 False，调用方回落成原来的文字，反馈绝不丢。
+        """
+        if not emoji_ids or not isinstance(event, AiocqhttpMessageEvent):
+            return False
+        mid = getattr(event.message_obj, "message_id", None)
+        if mid is None:
+            return False
+        self_id = getattr(event.message_obj, "self_id", None)
+        ok = False
+        for emoji_id in emoji_ids:
+            params: dict = {"message_id": mid, "emoji_id": emoji_id, "set": add}
+            if self_id:
+                params["self_id"] = self_id
+            try:
+                await event.bot.call_action("set_msg_emoji_like", **params)
+                ok = True
+                if add:
+                    return True  # 贴上第一个候选就收手，别把消息贴成圣诞树
+            except Exception as e:
+                self.logger.info(f"[weibo_album] 贴表情失败（emoji {emoji_id}）：{e}")
+        return ok
+
+    @asynccontextmanager
+    async def _working(self, event: AstrMessageEvent):
+        """指令处理期间在触发消息上贴"恳求"，无论结局如何收场时都撤掉。
+
+        结局由各收场点自己表达：得意 全部传完 / 尴尬 整批已传过 / 流泪+文字
+        有失败 / 纯文字（没有图片、相册列表等）。finally 兜底保证异常路径也不
+        会在消息上留下一个"进行中"的表情。
+        """
+        await self._react(event, EMOJI_WORKING)
+        try:
+            yield
+        finally:
+            await self._react(event, EMOJI_WORKING, add=False)
 
     def _num(self, key: str, default, cast=int):
         try:
@@ -465,6 +518,10 @@ class WeiboAlbumPlugin(Star):
             await self._locked(event, gid, lambda: self._push(event, gid, text))
 
     async def _push(self, event: AstrMessageEvent, gid: str, want: str) -> None:
+        async with self._working(event):
+            await self._push_run(event, gid, want)
+
+    async def _push_run(self, event: AstrMessageEvent, gid: str, want: str) -> None:
         # 顺手把别的群过期的暂存批次清掉；本群过期的清完后走下面的"没有待上传"
         self._sweep_pending()
         job = self._pending.get(gid)
@@ -500,6 +557,10 @@ class WeiboAlbumPlugin(Star):
             await self._reply(event, f"出错了：{e}")
 
     async def _grab(self, event: AstrMessageEvent, gid: str, text: str) -> None:
+        async with self._working(event):
+            await self._grab_run(event, gid, text)
+
+    async def _grab_run(self, event: AstrMessageEvent, gid: str, text: str) -> None:
         try:
             link_text, want = await self._link_from_args(event, text)
             # 平台不对就直说，别白抓一轮才发现调不到相册接口
@@ -559,7 +620,10 @@ class WeiboAlbumPlugin(Star):
                     # 相册名写错了也别把已经下好的图丢掉，直接转成"现选一个"
                     await self._ask_album(event, nc, gid, files, f"{head}\n{e}")
                     return
-                await self._reply(event, f"{head}，开始整批上传到相册「{album[1]}」…")
+                if note or gif_n or fails or video_n:
+                    # 有干货（截断/live 图/下载失败/视频）才发文字；
+                    # "开始整批上传"这件事由消息上的"恳求"表情表达
+                    await self._reply(event, head)
                 await self._upload(event, nc, gid, album, files)
             else:
                 await self._ask_album(event, nc, gid, files, head)
@@ -827,6 +891,8 @@ class WeiboAlbumPlugin(Star):
             # 这批全都传过，本地文件不会再有人用，当场清掉别占着 temp
             shutil.rmtree(folder, ignore_errors=True)
             self._pending.pop(gid, None)
+            if await self._react(event, EMOJI_DUP):
+                return
             await self._reply(
                 event,
                 f"这 {len(files)} 张之前已经传进相册「{album_name}」了，无需重复上传"
@@ -913,17 +979,23 @@ class WeiboAlbumPlugin(Star):
                 self.payload = learned
                 await self.put_kv_data(PAYLOAD_KEY, learned)
 
-        # 完成回复只报结果：状态 + 成功张数；失败时附明细，好让 /补传 补传
-        state = "上传未完成" if fails else "上传完成"
-        msg = f"{state}：成功 {ok}/{len(todo)} 张 -> 相册「{album_name}」"
-        if dup:
-            msg += f"（另有 {dup} 张已传过，跳过）"
+        # 收场表达：有失败 贴"流泪"+明细文字（/补传 靠它补传）；全部成功只贴
+        # "得意"不刷屏，表情贴不上（协议端太老）才回落成完成文字
         if fails:
+            await self._react(event, EMOJI_FAIL)
+            msg = f"上传未完成：成功 {ok}/{len(todo)} 张 -> 相册「{album_name}」"
+            if dup:
+                msg += f"（另有 {dup} 张已传过，跳过）"
             msg += "\n失败明细：\n" + "\n".join(fails[:5])
             if len(fails) > 5:
                 msg += f"\n…另有 {len(fails) - 5} 张失败"
             msg += "\n失败的还在，30 分钟内发 /补传 可只重传那几张（仍传到本相册）"
-        await self._reply(event, msg)
+            await self._reply(event, msg)
+        elif not await self._react(event, EMOJI_DONE):
+            msg = f"上传完成：成功 {ok}/{len(todo)} 张 -> 相册「{album_name}」"
+            if dup:
+                msg += f"（另有 {dup} 张已传过，跳过）"
+            await self._reply(event, msg)
 
     @filter.command("看图")
     async def preview(self, event: AstrMessageEvent, text: GreedyStr):

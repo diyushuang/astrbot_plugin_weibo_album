@@ -325,6 +325,9 @@ class FakeCommandRouter:
         raise AssertionError(f"没有指令匹配到 {message_str!r}")
 
 
+_MSG_SEQ = [9000]  # 自增的消息 id：每条假事件一条，表情回应按它归属到事件
+
+
 def make_event(
     text, group_id="123456", admin=True, napcat=True, quote=None, reply_chain=None
 ):
@@ -335,26 +338,32 @@ def make_event(
     """
     base = EVENT_BASE if napcat else object
     bot = EVENT_BOT if napcat else None
+    _MSG_SEQ[0] += 1
+    mid = _MSG_SEQ[0]
 
     class E(base):
         def __init__(self):
             self.message_str = text
             self.sent = []
+            self.message_id = mid
             self.stopped = False
             self.is_admin_flag = admin
             if quote:
                 self.message_obj = types.SimpleNamespace(
                     self_id=10001 if bot else None,
+                    message_id=mid,
                     message=[Reply(id=quote)],
                 )
             elif reply_chain:
                 self.message_obj = types.SimpleNamespace(
                     self_id=10001 if bot else None,
+                    message_id=mid,
                     message=[Reply(id="801", chain=list(reply_chain))],
                 )
             else:
                 self.message_obj = types.SimpleNamespace(
                     self_id=10001 if bot else None,
+                    message_id=mid,
                     message=[],
                 )
             self.bot = bot
@@ -521,6 +530,16 @@ class FakeNapCat:
                 "raw_message": payload.get("raw", ""),
                 "sender": {"user_id": "88888", "nickname": "分享者"},
             }
+        if action == "set_msg_emoji_like":
+            # 表情回应：记录 (message_id, emoji_id, set)，供用例断言开始/收场表达
+            store.setdefault("reacts", []).append(
+                (
+                    params.get("message_id"),
+                    params.get("emoji_id"),
+                    params.get("set", True),
+                )
+            )
+            return {}
         if action == "get_qun_album_list":
             names = store.get("album_names") or {
                 "0_aaaaaaaa": "微博原图",
@@ -575,6 +594,7 @@ def reset_store(store):
     store["uploads"] = []
     store["media"] = []
     store["calls"] = []
+    store["reacts"] = []
     store["fail_uploads"] = 0
     store["fail_downloads"] = 0
     store["gateway_502"] = 0
@@ -592,6 +612,11 @@ async def main():
 
     flt, Star, _, registered = install_fake_astrbot()
     store = {"uploads": [], "media": [], "calls": [], "reject_path": 0}
+
+    def reacts_of(ev):
+        """这个事件触发的消息上收到的表情回应 [(message_id, emoji_id, set)]。"""
+        return [r for r in store["reacts"] if r[0] == ev.message_id]
+
     # event.bot 是 aiocqhttp 的 CQHttp：动作口是 bot.call_action，没有 .api 这一层
     EVENT_BOT = types.SimpleNamespace(call_action=FakeNapCat(store).call_action)
 
@@ -727,14 +752,12 @@ async def main():
         )
         names_up = [Path(u["file"]).name for u in store["uploads"]]
         assert all(n.endswith((".jpg", ".png", ".gif")) for n in names_up), names_up[:3]
-        assert "上传完成：成功 18/18 张" in ev.sent[-1], ev.sent[-1]
-        assert "base64" not in ev.sent[-1] and "本地暂存" not in ev.sent[-1], (
-            ev.sent[-1],
-            "完成回复只报状态和张数，不带载荷方式/清理提示这些实现细节",
-        )
-        assert len(ev.sent) == 2, (
-            f"一步到位整批只该有两条群消息（开始提示 + 完成汇总），实际 {len(ev.sent)} 条"
-        )
+        # 全部成功：只在触发消息上贴表情（⏳ 受理 → 👍 收场），不再发过程文字
+        assert not ev.sent, f"全部成功不该再发文字，实际: {ev.sent}"
+        pairs = [(r[1], r[2]) for r in reacts_of(ev)]
+        assert (111, True) in pairs, f"指令受理该贴恳求(111): {pairs}"
+        assert (4, True) in pairs, f"整批传完该贴得意(4): {pairs}"
+        assert (111, False) in pairs, f"收场该撤掉恳求(111): {pairs}"
         assert not list(plugin.root.glob("*")), "传完之后暂存批次该删掉"
         assert len(store["uploads"]) == len(
             {Path(u["file"]).name for u in store["uploads"]}
@@ -751,9 +774,9 @@ async def main():
         assert len(store["uploads"]) == before, (
             f"去重没生效，又多传了 {len(store['uploads']) - before} 张"
         )
-        assert any("之前已经传进" in s and "无需重复上传" in s for s in ev2.sent), (
-            ev2.sent
-        )
+        # 整批都已传过：贴 🔁，不发"无需重复上传"文字
+        assert not ev2.sent, ev2.sent
+        assert (100, True) in [(r[1], r[2]) for r in reacts_of(ev2)], reacts_of(ev2)
         assert not list(plugin.root.glob("*")), (
             "整批都已传过时，刚下载的临时文件该当场清掉，不能占着 temp"
         )
@@ -972,7 +995,8 @@ async def main():
         assert 999 - store["reject_path"] == 0, "后续批次开局就该记住用 base64"
         assert len(store["uploads"]) == N_PICS, ev17b.sent[-1]
         store["reject_path"] = 0
-        assert any("上传完成" in s for s in ev17b.sent), ev17b.sent[-1]
+        assert not ev17b.sent, ev17b.sent
+        assert (4, True) in [(r[1], r[2]) for r in reacts_of(ev17b)], reacts_of(ev17b)
         ledger = {k: len(v) for k, v in plugin._kv.items() if k.startswith("sent:")}
         assert sum(ledger.values()) >= N_PICS, ledger
         print("[ok] 用例14b 学到的载荷方式跨批次保留，NapCat 侧零条 ENOENT")
@@ -987,7 +1011,9 @@ async def main():
         assert len(store["uploads"]) == before18, (
             f"相册文件名对不上 pid，第二次执行又多传了 {len(store['uploads']) - before18} 张"
         )
-        assert any("之前已经传进" in s for s in ev18.sent), ev18.sent
+        # 整批已传过：贴尴尬(100)，不发文字
+        assert not ev18.sent, ev18.sent
+        assert (100, True) in [(r[1], r[2]) for r in reacts_of(ev18)], reacts_of(ev18)
         plugin.config["upload_concurrency"] = 3
         print("[ok] 用例14c 相册文件名对不上 pid 时，第二次执行按上传记录跳过")
 
@@ -1031,7 +1057,9 @@ async def main():
             len(store["uploads"]),
             ev21.sent[-1:],
         )
-        assert "成功 3/" in ev21.sent[-1], ev21.sent[-1]
+        # 重传闭环后全部成功：贴得意(4)，不发文字
+        assert not ev21.sent, ev21.sent
+        assert (4, True) in [(r[1], r[2]) for r in reacts_of(ev21)], reacts_of(ev21)
         assert not list(plugin.root.glob("*")), "补传完成，暂存目录该清掉"
         print("[ok] 用例16 一步到位失败 3 张后 /补传 只补传那 3 张，闭环后暂存清空")
 
@@ -1048,7 +1076,9 @@ async def main():
             f"重试成功的每张只该落一张，实际 {len(store['uploads'])} 张"
         )
         assert not any("失败明细" in s for s in ev22.sent), ev22.sent
-        assert f"成功 {N_PICS}/{N_PICS}" in ev22.sent[-1], ev22.sent[-1]
+        # 502 全部被重试兜住：贴得意(4) 收场
+        assert not ev22.sent, ev22.sent
+        assert (4, True) in [(r[1], r[2]) for r in reacts_of(ev22)], reacts_of(ev22)
         print("[ok] 用例16b 网关 502 被退避重试兜住，整批仍报全部成功且没有传重")
 
         # ---- 用例 17：skip_exists=False 时部分失败，重传不能对已删的成功张报错
@@ -1067,7 +1097,9 @@ async def main():
         store["fail_uploads"] = 0
         ev31 = make_event("")
         await rt.dispatch("补传", ev31)
-        assert "成功 3/" in ev31.sent[-1], ev31.sent[-1]
+        # 重传全部成功：贴得意(4)，不发文字
+        assert not ev31.sent, ev31.sent
+        assert (4, True) in [(r[1], r[2]) for r in reacts_of(ev31)], reacts_of(ev31)
         assert not list(plugin.root.glob("*")), "补传完成，暂存该清掉"
         plugin.config["skip_exists"] = True
         print("[ok] 用例17 skip_exists=False 时重传闭环依然成立（pending 只留失败张）")
@@ -1089,7 +1121,9 @@ async def main():
         assert all(u["album_id"] == "0_bbbbbbbb" for u in store["uploads"]), ev32.sent[
             -1:
         ]
-        assert "成功 1/" in ev32.sent[-1], ev32.sent[-1]
+        # 重传全部成功：贴得意(4)，不发文字
+        assert not ev32.sent, ev32.sent
+        assert (4, True) in [(r[1], r[2]) for r in reacts_of(ev32)], reacts_of(ev32)
         store["album_names"] = None
         reset_store(store)
         print("[ok] 用例18 批次记住目标相册：改名后裸 /补传 仍传回原相册（按 ID）")
@@ -1261,8 +1295,11 @@ async def main():
         joined = "\n".join(ev41.sent)
         # 视频条目不再被当封面图上传，回复里注明数量
         assert "视频未上传" in joined, ev41.sent
-        # 上传闭环照常走完
-        assert any("上传完成" in s or "上传未完成" in s for s in ev41.sent), ev41.sent
+        # 上传闭环照常走完：全部成功贴 👍（贴不上才回落文字）
+        ev41_pairs = [(r[1], r[2]) for r in reacts_of(ev41)]
+        assert (4, True) in ev41_pairs or any(
+            "上传完成" in s or "上传未完成" in s for s in ev41.sent
+        ), (ev41.sent, ev41_pairs)
         n_uploaded = len(store["uploads"])
         assert n_uploaded > 0, f"混合微博的图片一张都没传上: {ev41.sent}"
         # 上传的载荷解码后都应该是图片（GIF/JPG/PNG），mp4 不会混进来
@@ -1337,13 +1374,14 @@ async def main():
         assert all(
             n.startswith("1040g2sg30") and n.endswith(".png") for n in up_names
         ), up_names
-        assert "上传完成：成功 4/4 张" in ev50.sent[-1], ev50.sent[-1]
-        assert len(ev50.sent) == 2, ev50.sent
+        assert not ev50.sent, ev50.sent
+        assert (4, True) in [(r[1], r[2]) for r in reacts_of(ev50)], reacts_of(ev50)
         # 去重：同一条笔记再传一次全部跳过（台账按 pid 记，与平台无关）
         ev51 = make_event(XHS_NOTE_URL)
         await rt.dispatch(f"传图 {XHS_NOTE_URL} | 小红书好图", ev51)
         assert len(store["uploads"]) == 4, ev51.sent[-1:]
-        assert any("无需重复上传" in s for s in ev51.sent), ev51.sent
+        assert not ev51.sent, ev51.sent
+        assert (100, True) in [(r[1], r[2]) for r in reacts_of(ev51)], reacts_of(ev51)
         # 旧命令已彻底下线：假路由器对未注册命令抛"没有指令匹配"（真实 AstrBot
         # 里则是什么都不做）。先清掉上传记录，"没有任何新上传"才有意义
         reset_store(store)
