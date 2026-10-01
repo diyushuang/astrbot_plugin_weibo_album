@@ -6,6 +6,7 @@
 
 import asyncio
 import hashlib
+import os
 import re
 import shutil
 import time
@@ -26,6 +27,12 @@ try:
     from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 except ImportError:  # 老版本 AstrBot 还没有 temp 路径，退回插件数据目录
     get_astrbot_temp_path = None
+
+try:
+    # 存储规范：插件的持久数据放 data/plugin_data/<插件名>/ 下
+    from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+except ImportError:
+    get_astrbot_data_path = None
 
 from .img_compress import PILImage, recompress_image
 from .napcat_album import (
@@ -59,6 +66,12 @@ CPU_HEAVY = 2  # ffmpeg 转码 / Pillow 重压这类重 CPU 活的全局并发�
 COMPRESS_OVER_MB = 8  # 超过该体积的原图上传前重压成 JPEG（0 关闭）
 COMPRESS_LONG_SIDE = 5000  # 重压时长边上限：相册浏览用不到比这更大的分辨率
 COMPRESS_QUALITY = 85  # JPEG 质量：观感与原图无异，体积差一个数量级
+UPLOAD_PAYLOAD_MB = (
+    32  # 全群同时在途的上传载荷总量预算（MB，0 关闭）：小内存服务器的硬顶
+)
+DISK_FLOOR_MB = (
+    1024  # 批次下载前要求 temp 所在盘至少剩余的空间（MB），防写满磁盘导致整机异常
+)
 # 传图进度的表情回应（QQ"贴表情"，NapCat 的 set_msg_emoji_like）：开始/收场这类
 # 过程性提示改贴表情，群里少刷两条机器人消息。emoji_id 用 QQ 小黄脸表情 ID，
 # 候选取自 astrbot_plugin_emoji_like 按情绪整理过的实战可用池；每个状态备几个
@@ -153,6 +166,11 @@ class WeiboAlbumPlugin(Star):
         self._up_conc = UPLOAD_CONC  # _up_sem 建立时的并发配置，热改配置后重建
         self._cpu_sem = asyncio.Semaphore(CPU_HEAVY)
         self._compress_warned = False  # 配了重压但没装 Pillow 时只警告一次
+        # 上传载荷字节闸：张数并发挡不住"单张特别大"的图——Pillow 缺失或没压到
+        # 阈值以下时，几张 20MB 级原图的 base64 载荷就能同时吃掉几百 MB（插件侧
+        # 和 NapCat 侧各算一遍）。按在途字节总量排队，给内存一个真正的硬顶。
+        self._up_bytes = 0
+        self._up_bytes_cond = asyncio.Condition()
         self.payload = ""  # 同机探测过能用的载荷方式（path / base64）
         self._ffmpeg = ""  # ffmpeg 可执行文件路径，initialize 时探测
         # 暂存根目录：优先 AstrBot 自带的 data/temp，本来就是放临时文件的地方，
@@ -162,6 +180,14 @@ class WeiboAlbumPlugin(Star):
             self.root = Path(get_astrbot_temp_path()) / name
         else:
             self.root = Path(StarTools.get_data_dir(name)) / "temp"
+        # 诊断文件：放 data/plugin_data 下持久保存（temp 会被本插件清场，不能放）。
+        # 整机被顶死后主日志往往来不及看，这里在重负载动作"之前"写好每批的体量
+        # 与配置快照，重启后直接读，不用复现。
+        if get_astrbot_data_path is not None:
+            diag_dir = Path(get_astrbot_data_path()) / "plugin_data" / name
+        else:
+            diag_dir = StarTools.get_data_dir(name)
+        self.diag_path = diag_dir / "diagnostic.log"
 
     @property
     def same_host(self) -> bool:
@@ -171,12 +197,33 @@ class WeiboAlbumPlugin(Star):
     async def initialize(self):
         self.root.mkdir(parents=True, exist_ok=True)
         self._wipe_leftovers()
+        try:
+            self.diag_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         self.payload = await self.get_kv_data(PAYLOAD_KEY, "") or ""
         # live 图转 GIF 依赖宿主机的 ffmpeg：AstrBot 官方 Docker 镜像自带，
         # 没有（或转换失败）时 live 图自动回落成封面静图
         self._ffmpeg = shutil.which("ffmpeg") or ""
         if not self._ffmpeg:
             self.logger.info("[weibo_album] 未找到 ffmpeg，live 图将只上传封面静图")
+        if PILImage is None:
+            self.logger.warning(
+                "[weibo_album] 未安装 Pillow（pip install pillow），超大图重压"
+                "（compress_over_mb）不会生效，大图将按原图 base64 上传，"
+                "内存紧张的服务器请务必安装"
+            )
+        else:
+            self.logger.info(
+                "[weibo_album] Pillow 可用，超过 compress_over_mb 阈值的图将重压后上传"
+            )
+        self._diag(
+            f"启动 Pillow={'有' if PILImage is not None else '无'} "
+            f"ffmpeg={'有' if self._ffmpeg else '无'} "
+            f"compress_over_mb={self._num('compress_over_mb', COMPRESS_OVER_MB)} "
+            f"upload_concurrency={self._num('upload_concurrency', UPLOAD_CONC)} "
+            f"upload_payload_mb={self._num('upload_payload_mb', UPLOAD_PAYLOAD_MB, float)}"
+        )
         await self._get_session()
 
     async def terminate(self):
@@ -285,6 +332,27 @@ class WeiboAlbumPlugin(Star):
         except (TypeError, ValueError):
             self.logger.warning(f"[weibo_album] 配置项 {key} 不可用，按 {default} 处理")
             return default
+
+    def _diag(self, msg: str) -> None:
+        """把关键诊断行落到独立的追加式文件（写后立即刷盘）。
+
+        整机被顶死之后，AstrBot 主日志往往来不及刷/没机会看；这份文件在重负载
+        动作发生"之前"落盘，重启后读它就能还原死机前最后几批的体量与配置，
+        不用复现。失败静默：诊断本身不能变成新的故障点。超过 512KB 只留后半段。
+        """
+        try:
+            self.diag_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.diag_path.exists() and self.diag_path.stat().st_size > 512 * 1024:
+                lines = self.diag_path.read_text(encoding="utf-8").splitlines(True)
+                self.diag_path.write_text(
+                    "".join(lines[len(lines) // 2 :]), encoding="utf-8"
+                )
+            with open(self.diag_path, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            pass
 
     async def _group_of(self, event: AstrMessageEvent) -> str:
         """群号；非群聊直接回提示（返回空串由调用方收场）。"""
@@ -596,6 +664,19 @@ class WeiboAlbumPlugin(Star):
                     f"{len(images)} 张一张都没下载下来：\n" + "\n".join(fails[:5]),
                 )
                 return
+            # 批次体量进日志：日志里总大小异常大（几百 MB）说明 Pillow 重压没生效，
+            # 这是"传图把小服务器顶爆"最常见的原因，排查时先看这一行
+            total_mb = await asyncio.to_thread(
+                lambda: sum(p.stat().st_size for _, p in files) / 1048576
+            )
+            self.logger.info(
+                f"[weibo_album] 批次 {folder.name}：{len(files)} 张，共 {total_mb:.1f}MB"
+            )
+            self._diag(
+                f"批次 {folder.name}：{len(files)} 张 {total_mb:.1f}MB "
+                f"重压={'on' if PILImage is not None else 'off(无Pillow)'} "
+                f"下载失败={len(fails)}"
+            )
             # 新批次已经落盘，上次"待选相册"放下的那批才算作废：万一这次抓取或
             # 下载全挂了，用户原本还能 /补传 的旧批次不能先被毁掉
             old = self._pending.pop(gid, None)
@@ -695,6 +776,13 @@ class WeiboAlbumPlugin(Star):
         信号量用全群共享的 _dl_sem：下载全程不再把整张图攒在内存里，但多个群同时
         开批时在途连接数仍要有个总顶。
         """
+        free_mb = shutil.disk_usage(self.root).free // 1048576
+        if free_mb < DISK_FLOOR_MB:
+            # 磁盘写满会让整机（数据库、日志、其他服务）一起异常，宁可拒收本批
+            raise WeiboError(
+                f"temp 所在磁盘仅剩 {free_mb}MB（低于 {DISK_FLOOR_MB}MB 保护线），"
+                "已取消本批下载：请清理磁盘或调低 max_images"
+            )
         sem = self._dl_sem
         want_gif = bool(self.config.get("live_gif", True)) and bool(self._ffmpeg)
 
@@ -759,6 +847,10 @@ class WeiboAlbumPlugin(Star):
         async with self._cpu_sem:
             done = await asyncio.to_thread(
                 recompress_image, path, COMPRESS_LONG_SIDE, COMPRESS_QUALITY
+            )
+        if done:
+            self.logger.info(
+                f"[weibo_album] 超大图已重压: {path.name} -> {path.with_suffix('.jpg').name}"
             )
         return path.with_suffix(".jpg") if done else path
 
@@ -873,6 +965,12 @@ class WeiboAlbumPlugin(Star):
             self._up_sem = asyncio.Semaphore(conc)
             self._up_conc = conc
         interval = self._num("upload_interval", 0.5, float)
+        # 载荷字节预算（全群共享）：张数并发挡不住"单张特别大"的图，Pillow 缺失或
+        # 没压到阈值以下时按在途字节排队，相当于自动降低并发。0 = 关闭。
+        budget_mb = self._num("upload_payload_mb", UPLOAD_PAYLOAD_MB, float)
+        payload_budget = (
+            float("inf") if budget_mb <= 0 else max(0.5, budget_mb) * 1048576
+        )
         existing = ""
         sent: set[str] = set()
         if self.config.get("skip_exists", True):
@@ -904,20 +1002,40 @@ class WeiboAlbumPlugin(Star):
         marks: list[str] = []
         done_files: list[Path] = []
         sem = self._up_sem  # 全群共享的上传总闸，别的群同时在传时在这里排队
+        upload_mb = await asyncio.to_thread(
+            lambda: sum(p.stat().st_size for _, p in todo) / 1048576
+        )
+        # 写在重负载动作之前并刷盘：死机后重启，看这行就知道死机前在传多大的批
+        self._diag(
+            f"上传 {len(todo)} 张 -> 相册「{album_name}」：{upload_mb:.1f}MB "
+            f"并发={conc} 预算={budget_mb}MB"
+        )
 
         async def push(im: Image, path: Path):
             async with sem:
+                size = path.stat().st_size  # noqa: ASYNC240  # 元数据 syscall
+                async with self._up_bytes_cond:
+                    # 字节闸：在途载荷总量超预算就排队；单个超预算的文件在
+                    # 空闸时照常放行，不会卡死
+                    while self._up_bytes and self._up_bytes + size > payload_budget:
+                        await self._up_bytes_cond.wait()
+                    self._up_bytes += size
                 try:
-                    mode = await nc.upload_file(gid, album_id, album_name, path)
-                except (NapCatError, OSError) as e:
-                    # 失败的那张留在本地，/补传 可以直接重传，不用重新抓
-                    self.logger.warning(f"[weibo_album] 上传失败 {im.url}: {e}")
-                    return None, f"{_mark(im)}：{e}"
-                if interval:
-                    # 传完占着并发槽歇 interval 再让位：只错开起点的话，稳态下
-                    # 槽位一空就放行，配置里的频控间隔会名存实亡
-                    await asyncio.sleep(interval)
-                return mode, None
+                    try:
+                        mode = await nc.upload_file(gid, album_id, album_name, path)
+                    except (NapCatError, OSError) as e:
+                        # 失败的那张留在本地，/补传 可以直接重传，不用重新抓
+                        self.logger.warning(f"[weibo_album] 上传失败 {im.url}: {e}")
+                        return None, f"{_mark(im)}：{e}"
+                    if interval:
+                        # 传完占着并发槽歇 interval 再让位：只错开起点的话，稳态下
+                        # 槽位一空就放行，配置里的频控间隔会名存实亡
+                        await asyncio.sleep(interval)
+                    return mode, None
+                finally:
+                    async with self._up_bytes_cond:
+                        self._up_bytes -= size
+                        self._up_bytes_cond.notify_all()
 
         results: list = []
         # same_host 又还没学到可用载荷时，第一张先单独探路，学到方式再放开并发，
@@ -996,6 +1114,7 @@ class WeiboAlbumPlugin(Star):
             if dup:
                 msg += f"（另有 {dup} 张已传过，跳过）"
             await self._reply(event, msg)
+        self._diag(f"上传结束：成功 {ok}/{len(todo)} 张，失败 {len(fails)}")
 
     @filter.command("看图")
     async def preview(self, event: AstrMessageEvent, text: GreedyStr):

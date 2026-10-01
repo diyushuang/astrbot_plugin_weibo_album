@@ -217,6 +217,12 @@ def install_fake_astrbot():
 
     pmod.get_astrbot_temp_path = get_astrbot_temp_path
 
+    def get_astrbot_data_path():
+        data_root.mkdir(parents=True, exist_ok=True)
+        return data_root
+
+    pmod.get_astrbot_data_path = get_astrbot_data_path
+
     mod("astrbot.core")
     mod("astrbot.core.platform")
     mod("astrbot.core.platform.sources")
@@ -759,6 +765,9 @@ async def main():
         assert (4, True) in pairs, f"整批传完该贴得意(4): {pairs}"
         assert (111, False) in pairs, f"收场该撤掉恳求(111): {pairs}"
         assert not list(plugin.root.glob("*")), "传完之后暂存批次该删掉"
+        assert "批次" in plugin.diag_path.read_text(encoding="utf-8"), (
+            "诊断文件应记录每批体量（死机后重启靠它排查，不需要复现）"
+        )
         assert len(store["uploads"]) == len(
             {Path(u["file"]).name for u in store["uploads"]}
         ), "本地文件名撞车了，整批传的是同一张"
@@ -1080,6 +1089,21 @@ async def main():
         assert not ev22.sent, ev22.sent
         assert (4, True) in [(r[1], r[2]) for r in reacts_of(ev22)], reacts_of(ev22)
         print("[ok] 用例16b 网关 502 被退避重试兜住，整批仍报全部成功且没有传重")
+
+        # ---- 用例 16c：载荷字节预算把并发自动压到接近串行，整批仍完整传完且不卡死
+        reset_store(store)
+        plugin.payload = "base64"
+        plugin.config["upload_payload_mb"] = 0.5  # 500KB 预算：在途字节闸必然生效
+        ev23b = make_event(WEIBO_LINK)
+        await rt.dispatch(f"传图 {WEIBO_LINK} | 微博原图", ev23b)
+        assert len(store["uploads"]) == N_PICS, (
+            f"字节预算压并发时整批该传完，实际 {len(store['uploads'])} 张"
+        )
+        assert not ev23b.sent, ev23b.sent
+        assert (4, True) in [(r[1], r[2]) for r in reacts_of(ev23b)], reacts_of(ev23b)
+        assert plugin._up_bytes == 0, "批次结束后在途字节预算应归零"
+        plugin.config["upload_payload_mb"] = 32
+        print("[ok] 用例16c 载荷字节预算压并发时整批仍传完，批次结束后预算归零")
 
         # ---- 用例 17：skip_exists=False 时部分失败，重传不能对已删的成功张报错
         reset_store(store)
