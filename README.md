@@ -12,7 +12,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-informational.svg)]()
 [![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A54.24-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![NapCat](https://img.shields.io/badge/NapCat-%E2%89%A54.8.101-red.svg)](https://github.com/NapNeko/NapCatQQ)
-[![Version](https://img.shields.io/badge/Version-v1.8.0-success.svg)]()
+[![Version](https://img.shields.io/badge/Version-v1.9.4-success.svg)]()
 
 </div>
 
@@ -102,7 +102,7 @@
 
 安装方式：
 
-1. **推荐**：AstrBot WebUI → 插件管理 → 上传发布 zip（`astrbot_plugin_weibo_album_v1.8.0.zip`）
+1. **推荐**：AstrBot WebUI → 插件管理 → 上传发布 zip（`astrbot_plugin_weibo_album_v1.9.4.zip`）
 2. 从源码目录复制，**目录名要和 `metadata.yaml` 里的 `name` 一致**，且只复制发布内容
    （`main.py`、`weibo_client.py`、`xhs_client.py`、`napcat_album.py`、`metadata.yaml`、
    `_conf_schema.json`、`requirements.txt`、`README.md`），`tests/`、`pyproject.toml`、`.git` 不需要进插件目录：
@@ -119,18 +119,24 @@
 | `xhs_cookie` | 空 | 小红书 Cookie。一般留空即可，游客通道能抓大部分笔记；个别笔记（如需登录可见）再填浏览器里的登录 Cookie |
 | `max_images` | `30` | 单次最多上传张数（微博单条上限 18，抓时间线时可调大）。下载是流式落盘不占内存，超大原图上传时由 `upload_payload_mb` 预算自动串行兜底 |
 | `max_pages` | `3` | 抓博主时间线/图集容器时的翻页数 |
+| `fetch_concurrency` | `3` | 同时在抓取的批次数（全群共享的总闸）。下载与上传本来各有总闸，抓取这一段原先没有：几个群同时发指令、或一个人连发几条 `/看图`，每条链路都要翻页 + 补详情，会一起打上游。填 `1` 完全串行 |
+| `container_detail_concurrency` | `3` | 抓博主相册/时间线时，页内补详情的并发数。列表页只给前 9 张图，长文与转发还要再查一次详情；填 `1` 退回逐条串行（最稳，也最慢） |
+| `download_concurrency` | `5` | 同时下载图片的张数（全群共享的总闸）。整批先并发落本地、再逐张传相册；调大更快也更吃带宽与磁盘 |
 | `upload_concurrency` | `3` | 同时在传相册的张数（全群共享的总闸，多个群同时触发也不会叠加）。NapCat 每张图要在内部串行发几十个 16KB 分片请求，串行传整批非常慢；调大更快，开始报"频繁"就往下调，填 `1` 回到串行 |
 | `upload_interval` | `0.5` | 每张传完占着并发槽休息的秒数，整批从头到尾保持节奏；撞频控优先调低并发数，其次调大这项，填 `0` 表示传完立刻接着传 |
 | `upload_payload_mb` | `32` | 所有群合计**同时在途的上传载荷总量**上限（MB），超了自动排队（相当于按体积自动降低并发）。base64 载荷会整包驻留插件与 NapCat 两边内存，上传未压缩的大原图批量进行时它就是保命闸。填 `0` 关闭 |
 | `skip_exists` | `true` | 不重复上传已经传过的图：既比对相册里的文件名，也比对本插件自己的上传记录（每个相册留 30 天 / 2000 条） |
+| `dedupe_before_download` | `true` | 下载前就先跳过已经传过的图。指令里带了相册名时，先查本插件往该相册传过的记录，直接把那几张从下载列表里去掉——重发同一条微博不再整批重抓重下。只在 `skip_exists` 也打开时生效 |
 | `live_gif` | `true` | 微博 live 图（livephoto）下载视频段用 ffmpeg 转成 GIF 再上传，相册里能看到动图。需要宿主机装有 ffmpeg（AstrBot 官方 Docker 镜像自带），没装或转换失败时自动回落上传封面静图。混在图里的真视频条目不传（群相册接口仅支持图片），回复里会注明数量 |
 | `same_host` | `false` | 声明 NapCat 与 AstrBot 共用文件系统，上传载荷改用本地路径，相册文件名就是微博 pid。**分容器部署别开**：开了 NapCat 读不到那些路径，每张图会在它控制台撞一条 ENOENT 再降级 base64（图照样传得上） |
 | `request_timeout` | `25` | 微博请求超时 |
+| `bootstrap_cooldown` | `60` | 未填 Cookie 时，微博要求先过一次访客网关（这一步是 9 个请求）。失败后不再每次都重跑：冷却期内跳过，连续失败按 60/120/240 秒递增（上限 10 分钟）。填 `0` 关掉冷却 |
 | `proxy` | 空 | 形如 `http://127.0.0.1:7890` |
 
 ## 💡 工作原理
 
-- 下载与上传拆成两阶段：整批并发落本地（全群共享的下载总闸限 5 路，流式边下边写），再按 `upload_concurrency` 并发提交上传（同样是全群共享的总闸）。多个群同时触发不会叠加资源占用，ffmpeg 转码另有 CPU 总闸（同时 2 个），超大原图上传还有 `upload_payload_mb` 字节预算兜底。
+- 三个阶段各有全群共享的总闸：抓取（`fetch_concurrency`）、下载（`download_concurrency`，流式边下边写）、上传（`upload_concurrency`）。多个群同时触发不会叠加资源占用，ffmpeg 转码另有 CPU 总闸（同时 2 个），超大原图上传还有 `upload_payload_mb` 字节预算兜底。
+- 去重分两道：指令带了相册名时，先在**下载之前**用本插件的上传台账把已传过的挑掉（`dedupe_before_download`），不为旧图白跑一轮下载；真正上传前再按相册文件名 + 台账逐张确认一遍。
 - 传图的开始/收场尽量不刷屏：在触发指令的消息上贴 QQ 表情回应——恳求(111) 进行中、得意(4) 全部传完、尴尬(100) 整批都已传过、流泪(5) 上传未完成，只有失败才发文字明细。表情 ID 体系与 [astrbot_plugin_emoji_like](https://github.com/Zhalslar/astrbot_plugin_emoji_like) 一致（QQ 小黄脸表情 ID，走 `set_msg_emoji_like`），每个状态备了几个候选按序尝试，全贴不上（协议端太老没有该接口）才回落成原来的文字提示。
 - 平台路由按"小红书优先"判定（笔记页/短链特征明显，误判成本为 0），微博链接走微博客户端，
   其余报"没识别到链接"；两套客户端接口对齐（`grab` / `download`），上传侧完全不感知平台。

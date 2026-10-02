@@ -22,6 +22,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 import types
 import uuid
 from pathlib import Path
@@ -120,6 +121,17 @@ class MessageEventResult(MessageChain):
         return self
 
 
+def log_exception(msg, *a):
+    """exception() 要连堆栈一起打出来。
+
+    AstrBot 的 logger.exception 会带 traceback；替身只 print 消息的话，插件里
+    `except Exception: logger.exception(...)` 吞掉的异常在测试输出里完全看不见，
+    只剩一句"未预期错误"，排障时等于两眼一抹黑。
+    """
+    print(f"[exception] {msg}", *a)
+    traceback.print_exc()
+
+
 def install_fake_astrbot():
     """造出插件用到的 astrbot API 面，签名与真实实现一致。"""
 
@@ -133,7 +145,11 @@ def install_fake_astrbot():
     mod("astrbot")
     aapi = mod("astrbot.api")
     aapi.logger = types.SimpleNamespace(
-        info=print, warning=print, exception=print, error=print, debug=print
+        info=print,
+        warning=print,
+        exception=log_exception,
+        error=log_exception,
+        debug=print,
     )
 
     registered = {"commands": [], "permissions": {}}
@@ -186,7 +202,11 @@ def install_fake_astrbot():
         def __init__(self, context=None, config=None):
             self.context = context
             self.logger = types.SimpleNamespace(
-                info=print, warning=print, exception=print, error=print, debug=print
+                info=print,
+                warning=print,
+                exception=log_exception,
+                error=log_exception,
+                debug=print,
             )
             self._kv = {}
 
@@ -444,10 +464,17 @@ def cache_network(module, store):
     bytes_cache: dict[str, bytes] = {}
     orig_grab, orig_dl = module.WeiboClient.grab, module.WeiboClient.download
 
-    async def grab(self, text, max_pages=3):
+    async def grab(self, text, max_pages=3, **kw):
+        """多余的关键字原样透传给真身。
+
+        包装器写死旧签名的话，插件一旦多传一个参数就是 TypeError，还会被插件顶层
+        的 except 兜成一句"出错了"——现象是"一张都没上传"，根因却完全看不见
+        （本轮给 grab 加 detail_conc 时正是这么翻车的）。关键字照转给 orig_grab，
+        真参数写错时仍然由真身抛错，严格性不丢。
+        """
         key = (text, max_pages)
         if key not in posts_cache:
-            posts_cache[key] = await orig_grab(self, text, max_pages=max_pages)
+            posts_cache[key] = await orig_grab(self, text, max_pages=max_pages, **kw)
         return posts_cache[key]
 
     async def download_to(self, img, dest, max_bytes=30 * 1024 * 1024):
@@ -792,6 +819,45 @@ async def main():
             "[ok] 用例2 重复执行按 pid 去重，并且提示确实发出去了（stop_event 后不再丢消息）"
         )
 
+        # ---- 用例 2b：去重前移到下载之前（本次优化）
+        # 用例 2 只验"传完本地清干净"，区分不出"下载完再删"和"压根没下"。这里直接
+        # 数下载调用：整批都已传过时应当连一次下载都不发，也连批次目录都不建。
+        before = len(store["uploads"])
+        real_download_to = module.WeiboClient.download_to
+        downs = []
+
+        async def counting_download_to(self, img, dest, max_bytes=30 * 1024 * 1024):
+            downs.append(img.key)
+            return await real_download_to(self, img, dest, max_bytes)
+
+        try:
+            module.WeiboClient.download_to = counting_download_to
+            ev2b = make_event(WEIBO_LINK)
+            await rt.dispatch(f"传图 {WEIBO_LINK} | 微博原图", ev2b)
+        finally:
+            module.WeiboClient.download_to = real_download_to
+        assert not downs, f"整批都已传过时不该再下载，实际下了 {len(downs)} 张"
+        assert len(store["uploads"]) == before, "不该有新上传"
+        assert not ev2b.sent, ev2b.sent
+        assert (100, True) in [(r[1], r[2]) for r in reacts_of(ev2b)], reacts_of(ev2b)
+        assert not list(plugin.root.glob("*")), "下载前收手就不该建批次目录"
+
+        # 关掉开关要能退回原来的行为：照旧整批下载，再由上传阶段逐张跳过
+        downs.clear()
+        plugin.config["dedupe_before_download"] = False
+        try:
+            module.WeiboClient.download_to = counting_download_to
+            ev2c = make_event(WEIBO_LINK)
+            await rt.dispatch(f"传图 {WEIBO_LINK} | 微博原图", ev2c)
+        finally:
+            module.WeiboClient.download_to = real_download_to
+            plugin.config["dedupe_before_download"] = True
+        assert len(downs) == N_PICS, (
+            f"关掉去重前移后应照原样下载全部 {N_PICS} 张，实际 {len(downs)}"
+        )
+        assert len(store["uploads"]) == before and not ev2c.sent, ev2c.sent
+        print("[ok] 用例2b 去重前移：整批都已传过时一次下载都不发，关掉开关退回原行为")
+
         # ---- 用例 3：关掉去重就真的重传
         plugin.config["skip_exists"] = False
         before3 = len(store["uploads"])
@@ -957,7 +1023,13 @@ async def main():
         a = asyncio.create_task(
             rt.dispatch(f"传图 {WEIBO_LINK} | 微博原图", make_event(WEIBO_LINK))
         )
-        await asyncio.sleep(0.6)
+        # 等第一批真的进入上传阶段再发第二发。这里不能靠固定 sleep：18 张原图
+        # 从微博下载完本身就可能超过原来的 0.6s，慢网络下上传还没开始就断言，
+        # 结果必然是"已传 0 张"（本用例的前提不是"上传已完成"，而是"上传中"）
+        deadline = time.monotonic() + 60
+        while not store["uploads"] and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert store["uploads"], "第一批迟迟没进入上传阶段，用例前提不成立"
         ev14 = make_event(WEIBO_LINK)
         await rt.dispatch(f"传图 {WEIBO_LINK} | 微博原图", ev14)
         assert any("正在处理" in s for s in ev14.sent), ev14.sent
@@ -1301,7 +1373,15 @@ async def main():
         hang_task = asyncio.create_task(
             rt.dispatch(f"传图 {WEIBO_LINK} | 微博原图", make_event(WEIBO_LINK))
         )
-        await asyncio.sleep(0.8)  # 等上传环节真的挂进假 NapCat
+        # 挂住的调用会先记进 calls，用它当"上传真的开始了"的判据；固定 sleep 在
+        # 慢网络下反而会早于下载完成，那时 _inflight 里只有下载任务，撤的就不是
+        # 这条用例要验的"在飞上传"
+        deadline = time.monotonic() + 60
+        while (
+            not any(a == "upload_image_to_qun_album" for a, _ in store["calls"])
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.05)
         assert plugin._inflight, "此刻应该有在飞的上传任务"
         await plugin.terminate()
         await hang_task

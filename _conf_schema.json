@@ -27,6 +27,20 @@
     "default": 3,
     "hint": "容器接口风控比单条微博严，调大容易撞限流"
   },
+  "fetch_concurrency": {
+    "description": "同时在抓取的批次数",
+    "type": "int",
+    "default": 3,
+    "hint": "抓取阶段（翻页 + 补详情）的全局上限，所有群合计。下载与上传本来各有总闸，只有抓取这一段原先没有，几个群同时发指令或一个人连发几条 /看图 时会一起打上游。撞限流就往下调，1 表示完全串行",
+    "obvious_hint": true
+  },
+  "container_detail_concurrency": {
+    "description": "抓博主相册时页内补详情的并发数",
+    "type": "int",
+    "default": 3,
+    "hint": "博主相册/时间线列表页只给前 9 张图，长文和转发还要再查一次详情。这一项是同时查几条的上限：调小更稳，填 1 退回逐条串行（慢，但最不容易撞风控）",
+    "obvious_hint": true
+  },
   "upload_concurrency": {
     "description": "同时在上传相册的张数",
     "type": "int",
@@ -40,6 +54,13 @@
     "default": 0.5,
     "hint": "配合并发用：每张传完占着并发槽歇这么久再让位，整批从头到尾都保持这个节奏。撞频控时优先调低并发数，其次调大这项；填 0 表示传完立刻接着传下一张"
   },
+  "download_concurrency": {
+    "description": "同时下载图片的张数",
+    "type": "int",
+    "default": 5,
+    "hint": "整批图先并发下载到本地，再一张一张传相册。调大下载更快也更吃带宽与磁盘，小机器或带宽紧张时往下调",
+    "obvious_hint": true
+  },
   "upload_payload_mb": {
     "description": "同时在途的上传载荷总量上限（MB）",
     "type": "float",
@@ -51,6 +72,13 @@
     "type": "bool",
     "default": true,
     "hint": "按微博图片 pid 与相册内文件名比对，重复执行同一条微博不会传重"
+  },
+  "dedupe_before_download": {
+    "description": "下载前就跳过已经传过的图",
+    "type": "bool",
+    "default": true,
+    "hint": "去重原先只在上传阶段做，而下载在它之前就跑完了：重发同一条微博会整批重抓 + 整批重下，最后才逐张跳过。打开后，指令里带了相册名时先查本插件往该相册传过的记录，直接把那几张从下载列表里去掉。只在「跳过相册里已有的图片」也打开时生效",
+    "obvious_hint": true
   },
   "live_gif": {
     "description": "live 图转 GIF 上传",
@@ -69,6 +97,13 @@
     "description": "微博请求超时（秒）",
     "type": "int",
     "default": 25
+  },
+  "bootstrap_cooldown": {
+    "description": "访客引导失败后的冷却（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "未填 Cookie 时，微博要求先过一次访客网关；这一步是 9 个请求，失败后如果每次都重跑，一条指令能把它乘成几百个请求。冷却期内不再重试，连续失败按 60/120/240 秒递增（上限 10 分钟）。填 0 关掉冷却（退回旧行为）",
+    "obvious_hint": true
   },
   "proxy": {
     "description": "代理地址",

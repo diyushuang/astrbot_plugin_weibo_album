@@ -11,3 +11,9 @@ dist/
 .env
 .env.*
 *.session
+
+# 本项目的内部资料，不进仓库
+#   .workbuddy/  —— 工作记忆与本地校验脚本
+#   docs/        —— 代码审查与优化方案（内部文档，非插件发布内容）
+.workbuddy/
+docs/

@@ -266,12 +266,14 @@ class XHSClient:
         referer: str = "https://www.xiaohongshu.com/",
         max_bytes: int = 0,
         sink: Path | None = None,
+        read_body: bool = True,
     ) -> tuple[int, str, bytes]:
         """GET 一个地址（手动逐跳跟随重定向），返回 (状态码, 最终 URL, body)。
 
         重定向手动跟：aiohttp 自动跳转会原样转发 Cookie 头，短链若跳去外站
         登录态就带出去了。每跳重判域名，只有落点是小红书站域名才带 Cookie。
         sink 给出且响应 200 时改为流式落盘（见 _stream_to_sink），body 返回空占位。
+        read_body=False 时一个字节都不读，只借状态码与最终 URL（短链跟跳转用）。
         """
         last: tuple[int, bytes] | None = None
         for attempt in range(RETRY_TIMES):
@@ -296,7 +298,22 @@ class XHSClient:
                                 current = urllib.parse.urljoin(str(r.url), loc)
                                 hop += 1
                                 continue
-                        if sink is not None and r.status == 200:
+                        if not read_body:
+                            # 只借这一跳拿最终地址：落地页多大都不读
+                            body = b""
+                        elif sink is not None and r.status == 200:
+                            # 落盘的是图片，text/html 只可能是风控页/错误页；不拦的话
+                            # >1KB 的 HTML 会被当图片存下来，报错推迟到上传才爆。
+                            # getattr 兜底：测试替身不一定有 headers
+                            ctype = str(
+                                (getattr(r, "headers", None) or {}).get(
+                                    "Content-Type", ""
+                                )
+                            ).lower()
+                            if "text/html" in ctype:
+                                raise XhsError(
+                                    f"拿到的是 HTML 页面（多半被风控拦了），不是图片：{url}"
+                                )
                             body = await self._stream_to_sink(r, sink, max_bytes)
                         elif max_bytes:
                             buf = bytearray()
@@ -381,17 +398,24 @@ class XHSClient:
         m = XHS_PAGE_RE.search(url)
         if m:
             return url, m.group(1)
-        # 短链：跟跳转拿笔记页
+        # 短链：跟跳转拿笔记页。常规落点就是笔记页，这一跳只借它的最终地址，
+        # 落地页多大都不读；只有落到非笔记页（JS 跳转的落地页）才需要页面内容
+        st, final, _ = await self._raw(
+            url, desktop=False, max_bytes=MAX_HTML_BYTES, read_body=False
+        )
+        m = XHS_PAGE_RE.search(final)
+        if m:
+            return final, m.group(1)
         st, final, body = await self._raw(url, desktop=False, max_bytes=MAX_HTML_BYTES)
         m = XHS_PAGE_RE.search(final)
-        if not m:
-            # 有些落地页是 JS 跳转：从 body 里找一遍笔记链接
-            for u in _xhs_url_candidates(body.decode("utf-8", "replace")):
-                m = XHS_PAGE_RE.search(u)
-                if m:
-                    return u, m.group(1)
-            raise XhsError(f"短链没有跳到小红书笔记页（http {st}）")
-        return final, m.group(1)
+        if m:
+            return final, m.group(1)
+        # 有些落地页是 JS 跳转：从 body 里找一遍笔记链接
+        for u in _xhs_url_candidates(body.decode("utf-8", "replace")):
+            m = XHS_PAGE_RE.search(u)
+            if m:
+                return u, m.group(1)
+        raise XhsError(f"短链没有跳到小红书笔记页（http {st}）")
 
     # ---------- 笔记 -> Post ----------
 

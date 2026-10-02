@@ -206,6 +206,16 @@ def _fail(action: str, detail: str, code: int = 0, note: str = "") -> NapCatErro
     )
 
 
+def _b64_payload(raw_b64: bytes) -> str:
+    """base64 字节拼成 NapCat 认的载荷串。
+
+    decode 出来的 ASCII 字符串与拼接结果又是两份 1.33 倍图片体积的拷贝（30MB
+    的原图各约 40MB）。它和 read_bytes / b64encode 一样是重活，必须一起丢线程池
+    ——留在事件循环里，并发上传几路就是每次都把整个 AstrBot 钉住几十到几百毫秒。
+    """
+    return "base64://" + raw_b64.decode("ascii")
+
+
 class NapCatAlbum:
     """走调用方注入的 caller —— 也就是 AstrBot 已经和 NapCat 建好的那条 OneBot 连接。"""
 
@@ -224,6 +234,8 @@ class NapCatAlbum:
         self.same_host = same_host
         self.backoff = backoff
         self.modes = self._ordered(preferred, same_host)
+        # resolve_album 顺手拉到的相册列表，供紧接着的"现选一个"复用（一次性）
+        self._last_albums: tuple[str, list[dict]] | None = None
 
     @staticmethod
     def _ordered(preferred: str, same_host: bool) -> list[str]:
@@ -341,6 +353,18 @@ class NapCatAlbum:
             return bool(page) and bool(nxt) and nxt != attach
         return bool(more) and nxt != attach
 
+    def take_cached_albums(self, group_id: str) -> list[dict] | None:
+        """取走 resolve_album 刚顺带拉到的相册列表（一次性，取完即弃）。
+
+        resolve_album 失败时要转去"列出来让用户现选一个"，那一步要的正是同一份
+        列表：不传过去就得多列一遍（NapCat 单页只给 10 个，相册多时要翻好几页）。
+        只认同一个群、且刚拉过的那一份，用完立即清掉，不会拿到陈旧数据。
+        """
+        cached, self._last_albums = self._last_albums, None
+        if cached and cached[0] == str(group_id):
+            return cached[1]
+        return None
+
     async def resolve_album(
         self, group_id: str, want: str, default_name: str = ""
     ) -> tuple[str, str]:
@@ -360,6 +384,8 @@ class NapCatAlbum:
             if looks_like_id:  # 列不出来时至少让 ID 直通，交给协议端裁决
                 return want, default_name or want
             raise
+        # 存一份给调用方复用：解析失败转"现选一个"时不必再列一遍
+        self._last_albums = (str(group_id), albums)
         for a in albums:
             if pick(a, ALBUM_LIST_ITEM_ID_KEYS) == want:
                 return want, pick(a, ALBUM_LIST_ITEM_NAME_KEYS, want)
@@ -433,7 +459,7 @@ class NapCatAlbum:
                 # 并发几路 20MB 级原图时这份省出来的就是小服务器的生死线。
                 # 同一批里换载荷重试的场合大不了再读一次盘。
                 raw = None
-                file = "base64://" + raw_b64.decode("ascii")
+                file = await asyncio.to_thread(_b64_payload, raw_b64)
                 del raw_b64
             try:
                 await self.call(

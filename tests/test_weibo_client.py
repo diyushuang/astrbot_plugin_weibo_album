@@ -656,10 +656,127 @@ async def download_to_cases():
     ok("download_to：主备全挂报错且不留垃圾文件")
 
 
+# ---------- 访客引导：失败冷却与真单飞（P0 回归） ----------
+#
+# 一次引导是 9 个请求（genvisitor + 两个域各一串重试），原先失败之后不留任何
+# 痕迹，下一个内容请求就再来一遍；容器页的补详情又是串行的，一条指令能把它
+# 乘成几百个请求。这两个用例就是钉住"失败进冷却"和"并发只有一路真跑"。
+
+
+async def bootstrap_cooldown_and_singleflight():
+    class _Resp:
+        status = 200
+        url = "https://passport.weibo.com/visitor/genvisitor?cb=gen_callback"
+        cookies = {}
+
+        async def read(self):
+            # 回一个没有 tid 的 body：引导必然失败，正好用来数它花了几个请求
+            return b"{}"
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Resp()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _CountingSession:
+        """数引导一共发了几个请求。"""
+
+        def __init__(self):
+            self.n = 0
+
+        def get(self, *a, **kw):
+            self.n += 1
+            return _Ctx()
+
+    s = _CountingSession()
+    c = WeiboClient(s)
+    assert await c.bootstrap_visitor() is False
+    first = s.n
+    assert first == 1, f"一次失败的引导该只发 1 个请求，实际 {first}"
+
+    # 冷却期内：普通调用与 force 调用都不该再打引导
+    # （force 是"上游刚回 403"的新证据，但它同样受冷却约束，否则一条指令里
+    #   连续几十次 403 就等于连续重引导，冷却形同虚设）
+    assert await c.bootstrap_visitor() is False
+    assert await c.bootstrap_visitor(force=True) is False
+    assert s.n == first, f"冷却期内不该再发请求，多发了 {s.n - first} 个"
+
+    # 冷却过后应当重新尝试（把冷却压到 0 模拟时间流逝）。
+    # 冷却基数在 WeiboClient 构造时就绑进实例了（bootstrap_cooldown 配置），
+    # 改模块常量对已有实例无效，这里直接改实例属性
+    c.bs_cooldown = 0.0
+    c._bootstrap_failed_at = 0.0
+    assert await c.bootstrap_visitor() is False
+    assert s.n == first + 1, "冷却过后该重新试一次引导"
+
+    # 连续失败按 60s / 120s / 240s… 拉开间隔，且有上限，不能无限翻倍
+    c.bs_cooldown = 60.0
+    for fails, want in ((1, 60.0), (2, 120.0), (3, 240.0), (9, 600.0)):
+        c._bootstrap_fails = fails
+        assert c._bootstrap_cooldown() == want, (
+            fails,
+            c._bootstrap_cooldown(),
+            "连续失败的冷却递增或封顶不对",
+        )
+
+    # 配置里填 0 就退回"失败也不记"的旧行为：每次调用都真去引导
+    s3 = _CountingSession()
+    c3 = WeiboClient(s3, bootstrap_cooldown=0)
+    assert await c3.bootstrap_visitor() is False
+    assert await c3.bootstrap_visitor() is False
+    assert s3.n == 2, f"配 0 时每次调用都该真引导，实际只发了 {s3.n} 个请求"
+
+    # 真单飞：并发 8 路引导只该真跑一路，其余在锁上等到结果后复查缓存
+    s2 = _CountingSession()
+    c2 = WeiboClient(s2)
+    await asyncio.gather(*(c2.bootstrap_visitor() for _ in range(8)))
+    assert s2.n == 1, f"并发引导该只发 1 个请求（真单飞），实际 {s2.n}"
+    ok("访客引导：失败进冷却（force 也不例外）、冷却递增有上限、并发调用真单飞")
+
+
+# ---------- read_body=False：短链只借状态码与最终 URL（P0 回归） ----------
+
+
+async def raw_read_body_skips_download():
+    class _Boom:
+        status = 200
+        url = "https://t.cn/A6BcD1234"
+        cookies = {}
+
+        async def read(self):
+            raise AssertionError("read_body=False 时不该读 body")
+
+        @property
+        def content(self):
+            raise AssertionError("read_body=False 时不该碰 content")
+
+    class _Ctx:
+        async def __aenter__(self):
+            return _Boom()
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Session:
+        def get(self, *a, **kw):
+            return _Ctx()
+
+    c = WeiboClient(_Session())
+    st, final, body = await c._raw("https://t.cn/A6BcD1234", read_body=False)
+    assert st == 200, st
+    assert final == "https://t.cn/A6BcD1234", final
+    assert body == b"", "read_body=False 时 body 该是空占位"
+    ok("read_body=False：短链只借状态码与最终 URL，一个字节的正文都不读")
+
+
 async def amain():
     await resolve_cases()
     await share_extract_cases()
     await bootstrap_no_selfwait()
+    await bootstrap_cooldown_and_singleflight()
+    await raw_read_body_skips_download()
     await net_error_message()
     await download_media_cases()
     await download_to_cases()

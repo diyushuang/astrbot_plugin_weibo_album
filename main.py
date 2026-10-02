@@ -44,6 +44,8 @@ from .napcat_album import (
 )
 from .weibo_client import (
     ANY_URL_RE,
+    BOOTSTRAP_COOLDOWN,
+    CONTAINER_DETAIL_CONC,
     Image,
     WeiboClient,
     WeiboError,
@@ -61,6 +63,9 @@ _GRAB_ERRORS = (WeiboError, XhsError, NapCatError)
 
 PREFETCH = 5  # 下载并发度：整批先落到本地，之后才传相册
 UPLOAD_CONC = 3  # 同时在传的张数。 NapCat 每张图内部要串行发几十个 16KB 分片，串行太慢
+FETCH_CONC = 3  # 抓取阶段（翻页 + 页内补详情）的全局并发上限。
+# 下载与上传本来各有总闸，只有抓取这一段原先一条都没有：几个群同时发指令、
+# 或者同一个人连发几条 /看图，每条链路自己还要翻页 + 补详情，全部叠起来打上游。
 CPU_HEAVY = 2  # ffmpeg 转码这类重 CPU 活的全局并发上限，防小机器被打满
 UPLOAD_PAYLOAD_MB = (
     32  # 全群同时在途的上传载荷总量预算（MB，0 关闭）：小内存服务器的硬顶
@@ -138,9 +143,13 @@ def split_album(text: str) -> tuple[str, str]:
 class WeiboAlbumPlugin(Star):
     """把微博 / 小红书笔记里的原图整套搬进 QQ 群相册：先整批抓到本地，再传到选定的相册。"""
 
-    def __init__(self, context: Context, config: dict):
+    def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
-        self.config = config
+        # config 必须有默认值：AstrBot 的加载器有三条构造路径，其中两条
+        # （core/star/star_manager.py 的"读不到配置"与"带 config 构造抛 TypeError
+        # 后的回退"）只传 context。这里写成必填的话，那两条路会直接
+        # TypeError 让整个插件加载失败，用户只能看到"插件加载失败"。
+        self.config = config or {}
         self._session: aiohttp.ClientSession | None = None
         self._wb: WeiboClient | None = None
         self._wb_sig: tuple = ()  # 上次建 WeiboClient 时的 (cookie, timeout, proxy)
@@ -158,9 +167,14 @@ class WeiboAlbumPlugin(Star):
         # 各开一批时内存/CPU 峰值照样翻倍。总闸把"在途张数"钉死在与单群相同
         # 的水位上，无论几个群同时触发、配置调多大，峰值都有一个硬顶。
         self._dl_sem = asyncio.Semaphore(PREFETCH)
+        self._dl_conc = PREFETCH  # _dl_sem 建立时的并发配置，热改配置后重建
         self._up_sem = asyncio.Semaphore(UPLOAD_CONC)
         self._up_conc = UPLOAD_CONC  # _up_sem 建立时的并发配置，热改配置后重建
         self._cpu_sem = asyncio.Semaphore(CPU_HEAVY)
+        # 抓取总闸：与下载/上传同款，全群共享。抓取是唯一原先没有任何闸的一段，
+        # 多个群同时触发或连发 /看图 时，并发链路数只受消息条数限制
+        self._fetch_sem = asyncio.Semaphore(FETCH_CONC)
+        self._fetch_conc = FETCH_CONC
         # 上传载荷字节闸：张数并发挡不住"单张特别大"的图——几张 20MB 级原图的
         # base64 载荷就能同时吃掉几百 MB（插件侧和 NapCat 侧各算一遍）。按在途
         # 字节总量排队，给内存一个真正的硬顶。
@@ -191,7 +205,9 @@ class WeiboAlbumPlugin(Star):
 
     async def initialize(self):
         self.root.mkdir(parents=True, exist_ok=True)
-        self._wipe_leftovers()
+        # 清残留可能要删上一次没传完的整批图（最多 30 张 × 30MB），同步删会把
+        # 事件循环钉住数秒——启动/热重载期间整个 AstrBot 都不响应，丢线程池里删
+        await asyncio.to_thread(self._wipe_leftovers)
         try:
             self.diag_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -202,7 +218,7 @@ class WeiboAlbumPlugin(Star):
         self._ffmpeg = shutil.which("ffmpeg") or ""
         if not self._ffmpeg:
             self.logger.info("[weibo_album] 未找到 ffmpeg，live 图将只上传封面静图")
-        self._diag(
+        await self._diag(
             f"启动 ffmpeg={'有' if self._ffmpeg else '无'} "
             f"upload_concurrency={self._num('upload_concurrency', UPLOAD_CONC)} "
             f"upload_payload_mb={self._num('upload_payload_mb', UPLOAD_PAYLOAD_MB, float)}"
@@ -224,19 +240,20 @@ class WeiboAlbumPlugin(Star):
             await self._session.close()
         self._session = None
 
-    def _sweep_pending(self, keep: str | None = None) -> None:
+    async def _sweep_pending(self, keep: str | None = None) -> None:
         """把过了 TTL 的暂存批次连文件带登记一起清掉。
 
         只靠 /补传 惰性检查的话，抓完不传的批次会一直占着 temp 到该群下一次
         指令；每次指令入口都扫一遍，过期批次活不过 TTL 太久。keep 传群号时跳过
         该群：_grab 正在给这个群换新批次，旧批次要等新图落盘后才作废。
+        删目录是阻塞 IO（可能几百 MB），丢线程池，别卡住事件循环。
         """
         now = time.time()
         for gid, job in list(self._pending.items()):
             if gid == keep or now - job["ts"] <= PENDING_TTL:
                 continue
             if job["files"]:
-                shutil.rmtree(job["files"][0][1].parent, ignore_errors=True)
+                await asyncio.to_thread(shutil.rmtree, job["files"][0][1].parent, True)
             self._pending.pop(gid, None)
 
     def _wipe_leftovers(self):
@@ -316,12 +333,12 @@ class WeiboAlbumPlugin(Star):
             self.logger.warning(f"[weibo_album] 配置项 {key} 不可用，按 {default} 处理")
             return default
 
-    def _diag(self, msg: str) -> None:
-        """把关键诊断行落到独立的追加式文件（写后立即刷盘）。
+    def _diag_write(self, msg: str) -> None:
+        """诊断行的同步落盘实现，由 _diag 丢进线程池执行。
 
-        整机被顶死之后，AstrBot 主日志往往来不及刷/没机会看；这份文件在重负载
-        动作发生"之前"落盘，重启后读它就能还原死机前最后几批的体量与配置，
-        不用复现。失败静默：诊断本身不能变成新的故障点。超过 512KB 只留后半段。
+        open/write/flush/fsync 一串都是阻塞 syscall，fsync 尤其要等落盘（数十 ms
+        级）。它被调用的位置全在重负载动作前后的 async 路径上，留在事件循环里
+        就是在这两处各钉一次循环。
         """
         try:
             self.diag_path.parent.mkdir(parents=True, exist_ok=True)
@@ -336,6 +353,15 @@ class WeiboAlbumPlugin(Star):
                 os.fsync(f.fileno())
         except OSError:
             pass
+
+    async def _diag(self, msg: str) -> None:
+        """把关键诊断行落到独立的追加式文件（写后立即刷盘）。
+
+        整机被顶死之后，AstrBot 主日志往往来不及刷/没机会看；这份文件在重负载
+        动作发生"之前"落盘，重启后读它就能还原死机前最后几批的体量与配置，
+        不用复现。失败静默：诊断本身不能变成新的故障点。超过 512KB 只留后半段。
+        """
+        await asyncio.to_thread(self._diag_write, msg)
 
     async def _group_of(self, event: AstrMessageEvent) -> str:
         """群号；非群聊直接回提示（返回空串由调用方收场）。"""
@@ -471,10 +497,17 @@ class WeiboAlbumPlugin(Star):
             self.config.get("weibo_cookie", ""),
             self._num("request_timeout", 25),
             self.config.get("proxy", ""),
+            self._num("bootstrap_cooldown", BOOTSTRAP_COOLDOWN),
         )
         # cookie/超时/代理在 WebUI 里热改后不用重载插件：签名变了就重建客户端
         if self._wb is None or self._wb.s is not s or self._wb_sig != sig:
-            self._wb = WeiboClient(s, cookie=sig[0], timeout=sig[1], proxy=sig[2])
+            self._wb = WeiboClient(
+                s,
+                cookie=sig[0],
+                timeout=sig[1],
+                proxy=sig[2],
+                bootstrap_cooldown=sig[3],
+            )
             self._wb_sig = sig
         return self._wb
 
@@ -497,14 +530,44 @@ class WeiboAlbumPlugin(Star):
             return "xhs", text
         return "weibo", text
 
+    def _fetch_gate(self) -> asyncio.Semaphore:
+        """当前生效的抓取总闸；WebUI 热改了并发配置就重建（在途的拿旧闸跑完）。"""
+        conc = max(1, self._num("fetch_concurrency", FETCH_CONC))
+        if conc != self._fetch_conc:
+            self._fetch_sem = asyncio.Semaphore(conc)
+            self._fetch_conc = conc
+        return self._fetch_sem
+
+    def _dl_gate(self) -> asyncio.Semaphore:
+        """当前生效的下载总闸；WebUI 热改了并发配置就重建。
+
+        这个是唯一在闸的东西就够了：单张下载已经有 30MB 上限、且是流式落盘，
+        并发数就是"在途连接数"和"在途磁盘写入量"的共同上界，不必再叠一道
+        字节闸（两道 condition 互相等待反而容易卡住）。
+        """
+        conc = max(1, self._num("download_concurrency", PREFETCH))
+        if conc != self._dl_conc:
+            self._dl_sem = asyncio.Semaphore(conc)
+            self._dl_conc = conc
+        return self._dl_sem
+
     async def _grab_posts(self, text: str) -> tuple[WeiboClient | XHSClient, list]:
         """按平台路由到对应客户端，返回 (客户端, Post 列表)。下载阶段还要用同一客户端。"""
         platform, target = self._route(text)
-        if platform == "xhs":
-            xhs = await self._xhs_client()
-            return xhs, await xhs.grab(target)
-        wb = await self._weibo()
-        return wb, await wb.grab(target, max_pages=self._num("max_pages", 3))
+        # 抓取总闸只包住网络抓取这一段（翻页 + 页内补详情），下载不占它的槽：
+        # 抓取是唯一原先完全没有闸的环节，不加的话"N 条指令 = N 条并发链路"。
+        async with self._fetch_gate():
+            if platform == "xhs":
+                xhs = await self._xhs_client()
+                return xhs, await xhs.grab(target)
+            wb = await self._weibo()
+            return wb, await wb.grab(
+                target,
+                max_pages=self._num("max_pages", 3),
+                detail_conc=self._num(
+                    "container_detail_concurrency", CONTAINER_DETAIL_CONC
+                ),
+            )
 
     async def _album_client(self, event: AstrMessageEvent) -> NapCatAlbum:
         if not isinstance(event, AiocqhttpMessageEvent):
@@ -513,7 +576,9 @@ class WeiboAlbumPlugin(Star):
                 "而这条消息不是来自 aiocqhttp(NapCat) 平台，调不到群相册接口"
             )
         bot = event.bot
-        self_id = event.message_obj.self_id
+        # 与 _react 处同款兜底：并非每个平台的 message_obj 都带 self_id，
+        # 直接取属性会在异常场景把整条指令打断
+        self_id = getattr(event.message_obj, "self_id", None)
 
         async def caller(action: str, params: dict):
             if self_id:
@@ -574,7 +639,7 @@ class WeiboAlbumPlugin(Star):
 
     async def _push_run(self, event: AstrMessageEvent, gid: str, want: str) -> None:
         # 顺手把别的群过期的暂存批次清掉；本群过期的清完后走下面的"没有待上传"
-        self._sweep_pending()
+        await self._sweep_pending()
         job = self._pending.get(gid)
         if not job:
             await self._reply(event, "没有待上传的图了，先 /传图 <链接> 抓一批")
@@ -636,12 +701,57 @@ class WeiboAlbumPlugin(Star):
                 note = f"（按上限截断到 {limit} 张）"
                 images = images[:limit]
 
+            # 去重前移：相册名已知时，先把"本插件往这个相册传过的"挑掉，不为已经
+            # 传过的图白跑一轮下载。去重原先只在上传阶段做，而下载远在它之前就
+            # 全量跑完了——重发同一条微博等于整批重抓 + 整批重下，最后才逐张跳过。
+            # 只用自记台账（KV，便宜）：它命中的图上传阶段本来就一定会跳过，是纯
+            # 收益；相册文件名那份命中仍留给上传阶段，免得为了它把一次翻页列表
+            # 请求提前到下载之前，也免得"还没定相册"的批次无从去重。
+            album: tuple[str, str] | None = None
+            album_err: NapCatError | None = None
+            if (
+                want
+                and self.config.get("skip_exists", True)
+                and self.config.get("dedupe_before_download", True)
+            ):
+                try:
+                    album = await nc.resolve_album(gid, want)
+                except NapCatError as e:
+                    # 相册解析不了不在这里收场：照原路先下载，再让用户现选一个
+                    # （已经下好的图不能因为相册名写错就丢掉）
+                    album_err = e
+                if album is not None:
+                    sent = await self._sent_marks(gid, album[0])
+                    if sent:
+                        before = len(images)
+                        images = [im for im in images if _mark(im) not in sent]
+                        if before > len(images):
+                            self.logger.info(
+                                f"[weibo_album] 下载前跳过「{album[1]}」已传过的 "
+                                f"{before - len(images)} 张"
+                            )
+                        if not images:
+                            # 整批都传过：与上传阶段那句同款收场（贴尴尬、不发
+                            # 文字），并且就地收手——不建批次目录，也不动旧
+                            # pending（它属于上一批，用户可能还要 /补传）
+                            if not await self._react(event, EMOJI_DUP):
+                                await self._reply(
+                                    event,
+                                    f"这 {before} 张之前已经传进相册"
+                                    f"「{album[1]}」了，无需重复上传",
+                                )
+                            return
+
             # 别的群过期的暂存批次顺手清；本群旧批次要等新图落盘后才作废
-            self._sweep_pending(keep=gid)
+            await self._sweep_pending(keep=gid)
             folder = self._job_dir(gid, posts)
-            files, fails = await self._download_all(client, images, folder)
+            files, fails, canceled = await self._download_all(client, images, folder)
+            if canceled:
+                # 下载被撤（热重载 / 关停）：剩下的步骤都指着已经被关掉的资源，
+                # 就地收手；半截批次留给下次启动的 _wipe_leftovers 清
+                return
             if not files:
-                shutil.rmtree(folder, ignore_errors=True)
+                await asyncio.to_thread(shutil.rmtree, folder, True)
                 await self._reply(
                     event,
                     f"{len(images)} 张一张都没下载下来：\n" + "\n".join(fails[:5]),
@@ -655,7 +765,7 @@ class WeiboAlbumPlugin(Star):
             self.logger.info(
                 f"[weibo_album] 批次 {folder.name}：{len(files)} 张，共 {total_mb:.1f}MB"
             )
-            self._diag(
+            await self._diag(
                 f"批次 {folder.name}：{len(files)} 张 {total_mb:.1f}MB "
                 f"下载失败={len(fails)}"
             )
@@ -665,7 +775,7 @@ class WeiboAlbumPlugin(Star):
             if old and old["files"]:
                 old_dir = old["files"][0][1].parent
                 if old_dir != folder:  # 同秒批次目录防撞后不会相同，这里再兜一道
-                    shutil.rmtree(old_dir, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, old_dir, True)
             head = f"已抓 {len(files)} 张原图{note}"
             gif_n = sum(1 for _, p in files if p.suffix.lower() == ".gif")
             if gif_n:
@@ -678,10 +788,23 @@ class WeiboAlbumPlugin(Star):
                 # 一步到位也要登记 pending：失败的那几张 /补传 才有得重传
                 self._pending[gid] = {"files": files, "albums": [], "ts": time.time()}
                 try:
-                    album = await nc.resolve_album(gid, want)
+                    if album is None:
+                        # 去重前移那一步解析过就直接复用；那次就失败的话原样抛出，
+                        # 不再对着同一个名字重复列一遍相册
+                        if album_err is not None:
+                            raise album_err
+                        album = await nc.resolve_album(gid, want)
                 except NapCatError as e:
-                    # 相册名写错了也别把已经下好的图丢掉，直接转成"现选一个"
-                    await self._ask_album(event, nc, gid, files, f"{head}\n{e}")
+                    # 相册名写错了也别把已经下好的图丢掉，直接转成"现选一个"；
+                    # 列表复用 resolve_album 刚拉到的那一份，不再重复列一遍
+                    await self._ask_album(
+                        event,
+                        nc,
+                        gid,
+                        files,
+                        f"{head}\n{e}",
+                        nc.take_cached_albums(gid),
+                    )
                     return
                 if note or gif_n or fails or video_n:
                     # 有干货（截断/live 图/下载失败/视频）才发文字；
@@ -749,7 +872,7 @@ class WeiboAlbumPlugin(Star):
 
     async def _download_all(
         self, client: WeiboClient | XHSClient, images: list[Image], folder: Path
-    ) -> tuple[list[tuple[Image, Path]], list[str]]:
+    ) -> tuple[list[tuple[Image, Path]], list[str], bool]:
         """整批并发下载到本地目录。
 
         下载可以并发，相册上传不行（QQ 侧频控 + 要按顺序回报新增数），所以两阶段拆开：
@@ -758,14 +881,17 @@ class WeiboAlbumPlugin(Star):
         信号量用全群共享的 _dl_sem：下载全程不再把整张图攒在内存里，但多个群同时
         开批时在途连接数仍要有个总顶。
         """
-        free_mb = shutil.disk_usage(self.root).free // 1048576
+        # statvfs 是阻塞 syscall，本批下载前的这道体检不该卡住事件循环
+        free_mb = (
+            await asyncio.to_thread(lambda: shutil.disk_usage(self.root).free)
+        ) // 1048576
         if free_mb < DISK_FLOOR_MB:
             # 磁盘写满会让整机（数据库、日志、其他服务）一起异常，宁可拒收本批
             raise WeiboError(
                 f"temp 所在磁盘仅剩 {free_mb}MB（低于 {DISK_FLOOR_MB}MB 保护线），"
                 "已取消本批下载：请清理磁盘或调低 max_images"
             )
-        sem = self._dl_sem
+        sem = self._dl_gate()
         want_gif = bool(self.config.get("live_gif", True)) and bool(self._ffmpeg)
 
         async def one(im: Image) -> tuple[Path | None, str]:
@@ -781,6 +907,10 @@ class WeiboAlbumPlugin(Star):
                     got = await client.download_to(im, path)
                 except _GRAB_ERRORS as e:
                     return None, f"{_mark(im)}：{e}"
+                except aiohttp.ClientError as e:
+                    # 热重载会关掉 session，在飞下载就地抛这个。原先没接住，异常
+                    # 一路穿透到顶层兜底，用户看到一句和真正原因无关的"出错了"
+                    return None, f"{_mark(im)}：请求中断（{e}）"
                 except OSError as e:
                     return None, f"{_mark(im)}：写本地文件失败 {e}"
                 if got and got != ext:
@@ -794,10 +924,24 @@ class WeiboAlbumPlugin(Star):
                         path = fixed
                 return path, ""
 
-        results = await asyncio.gather(*(one(im) for im in images))
+        # 下载任务同样登记进 _inflight：terminate 只撤这个集合里的东西，不登记的
+        # 话热重载时在飞下载会撞上刚被关掉的 session（异常不是消失就是穿透）。
+        # return_exceptions=True：被撤掉的那几张当成失败收下，别让 CancelledError
+        # 从 gather 里穿出去把父任务一起带走；整批被撤与否由调用方看 canceled 决定。
+        tasks = [asyncio.create_task(one(im)) for im in images]
+        self._inflight.update(tasks)
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._inflight.difference_update(tasks)
+        canceled = any(isinstance(r, asyncio.CancelledError) for r in results)
+        results = [
+            r if not isinstance(r, BaseException) else (None, f"{_mark(im)}：{r}")
+            for im, r in zip(images, results, strict=True)
+        ]
         files = [(im, p) for im, (p, _) in zip(images, results, strict=True) if p]
         fails = [msg for _, msg in results if msg]
-        return files, fails
+        return files, fails, canceled
 
     async def _live_gif(self, wb, im: Image, folder: Path) -> Path | None:
         """下载 live 图的视频段并转 GIF；任何一步失败返回 None，由上层回落封面。
@@ -817,20 +961,29 @@ class WeiboAlbumPlugin(Star):
         return gif
 
     async def _ask_album(
-        self, event: AstrMessageEvent, nc: NapCatAlbum, gid: str, files, head: str
+        self,
+        event: AstrMessageEvent,
+        nc: NapCatAlbum,
+        gid: str,
+        files,
+        head: str,
+        albums: list[dict] | None = None,
     ) -> None:
         """没写相册名就不猜：把相册列出来让用户这一次挑。
 
         pending 先登记再拉列表：列表拉挂了批次也还在，/补传 <相册名> 仍可重试，
-        不会变成没人引用的孤儿文件。
+        不会变成没人引用的孤儿文件。albums 传了就直接用（调用方刚拉过同一份，
+        就在这次指令里），省掉一整轮翻页列表请求。
         """
         job = {"files": files, "albums": [], "ts": time.time()}
         self._pending[gid] = job
-        albums = [
+        if albums is None:
+            albums = await nc.list_albums(gid)
+        pairs = [
             (pick(a, ALBUM_LIST_ITEM_ID_KEYS), pick(a, ALBUM_LIST_ITEM_NAME_KEYS, "?"))
-            for a in await nc.list_albums(gid)
+            for a in albums
         ]
-        job["albums"] = [pair for pair in albums if pair[0]]
+        job["albums"] = [pair for pair in pairs if pair[0]]
         if not job["albums"]:
             await self._reply(
                 event,
@@ -912,9 +1065,13 @@ class WeiboAlbumPlugin(Star):
         interval = self._num("upload_interval", 0.5, float)
         # 载荷字节预算（全群共享）：张数并发挡不住"单张特别大"的图，超大原图
         # 的 base64 载荷按在途字节排队，相当于自动降低并发。0 = 关闭。
+        # 闸里按原图字节计数，而 base64 载荷在插件与 NapCat 两侧各要驻留一份
+        # "base64://"+编码串，实测单张在途约为原图体积的 1.4~1.5 倍——预算按同
+        # 一个系数收紧，配置里填的才是"原图体积"口径，跟真实占用对得上。
+        # 单个文件本身就超预算时仍会放行（空闸条件下），不会因为收紧而死锁。
         budget_mb = self._num("upload_payload_mb", UPLOAD_PAYLOAD_MB, float)
         payload_budget = (
-            float("inf") if budget_mb <= 0 else max(0.5, budget_mb) * 1048576
+            float("inf") if budget_mb <= 0 else max(0.5, budget_mb) * 1048576 / 1.5
         )
         existing = ""
         sent: set[str] = set()
@@ -932,7 +1089,7 @@ class WeiboAlbumPlugin(Star):
         dup = len(files) - len(todo)
         if not todo:
             # 这批全都传过，本地文件不会再有人用，当场清掉别占着 temp
-            shutil.rmtree(folder, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, folder, True)
             self._pending.pop(gid, None)
             if await self._react(event, EMOJI_DUP):
                 return
@@ -951,7 +1108,7 @@ class WeiboAlbumPlugin(Star):
             lambda: sum(p.stat().st_size for _, p in todo) / 1048576
         )
         # 写在重负载动作之前并刷盘：死机后重启，看这行就知道死机前在传多大的批
-        self._diag(
+        await self._diag(
             f"上传 {len(todo)} 张 -> 相册「{album_name}」：{upload_mb:.1f}MB "
             f"并发={conc} 预算={budget_mb}MB"
         )
@@ -1059,7 +1216,7 @@ class WeiboAlbumPlugin(Star):
             if dup:
                 msg += f"（另有 {dup} 张已传过，跳过）"
             await self._reply(event, msg)
-        self._diag(f"上传结束：成功 {ok}/{len(todo)} 张，失败 {len(fails)}")
+        await self._diag(f"上传结束：成功 {ok}/{len(todo)} 张，失败 {len(fails)}")
 
     @filter.command("看图")
     async def preview(self, event: AstrMessageEvent, text: GreedyStr):
@@ -1068,7 +1225,21 @@ class WeiboAlbumPlugin(Star):
 
     async def _preview(self, event: AstrMessageEvent, text: str) -> None:
         event.stop_event()
+        # 群聊里与 /传图 共用同一把按群锁：/看图 走的是同一条抓取链路（翻页 +
+        # 补详情），不锁的话连发几条就是几条并发抓取叠在同一条微博上，和正在跑
+        # 的 /传图 还会把同一份内容重复抓一遍
+        gid = str(event.get_group_id() or "")
+        if gid:
+            await self._locked(event, gid, lambda: self._preview_run(event, text))
+        else:
+            # 私聊没有群号但也该能用（看图不碰相册）；并发由抓取总闸兜住
+            await self._preview_run(event, text)
+
+    async def _preview_run(self, event: AstrMessageEvent, text: str) -> None:
         try:
+            # 顺手清掉过期的暂存批次：原先只有 /传图 与 /补传 会扫，一个只发
+            # /看图 的群永远不会触发清扫
+            await self._sweep_pending()
             link_text, _ = await self._link_from_args(event, text)
             _, posts = await self._grab_posts(link_text)
             # 视频条目（含视频笔记的封面）不算可传图

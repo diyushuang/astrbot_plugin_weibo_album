@@ -22,6 +22,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # 测试脚本：sys.path 操作后的本地导入、async 测试主体里的少量同步文件操作
 "tests/*" = ["E402", "ASYNC230", "ASYNC240"]
+# ASYNC110（别在 while 里 sleep 轮询，改用 asyncio.Event）在 e2e 里不适用：
+# 那两处轮询等的是假 NapCat 往普通 dict 里写的计数（有没有开始上传），
+# 没有 Event 可等。等真条件比固定 sleep 稳，慢网络下固定 sleep 必然误判。
+"tests/test_plugin_e2e.py" = ["ASYNC110"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -26,7 +26,25 @@ RETRY_TIMES = 3  # 单请求最大尝试次数
 RETRY_BACKOFF = 0.8  # 网络异常退避步进（秒），按尝试次数递增
 RATE_BACKOFF = 0.6  # 403/418/432/429 风控退避步进
 BOOTSTRAP_WAIT = 15  # 等别的并发请求完成访客引导的上限
+# 引导失败后的冷却：这段时间内不再重跑引导。一次引导是 9 个请求，且失败原先
+# 不留任何痕迹，下一个内容请求就又来一遍——批内的补详情是串行的，一条指令就
+# 能把它乘成几百个请求。连续失败时按 60s/120s/240s… 递增，封顶 10 分钟。
+BOOTSTRAP_COOLDOWN = 60
+BOOTSTRAP_COOLDOWN_MAX = 600
 MAX_REDIRECTS = 5  # 手动跟随重定向的上限
+# HTML/JSON 响应体的读取上限。接口与页面正常情况下远小于这个数（一条 18 图的
+# status JSON 约百 KB），给上限是为了防上游返回异常大的页面时无上限地吃内存：
+# 文章页、兜底页原先走的是 r.read()，整页多大就吃多大。
+MAX_BODY_BYTES = 8 * 1024 * 1024
+# 容器页（博主相册/时间线）里，一张卡片要补详情请求的判据：列表只给前 9 张，
+# 满 9 张、长文、带转发都可能被截断，只有这些才值得再打一次详情接口。
+LIST_CARD_MAX_PICS = 9
+# 页内补详情的并发上限。补详情是串行 await 的话，一页十几张卡就是十几串行
+# 请求（每次内部还要访客引导 + 最多两个接口各重试 3 次），而这条路全程held着
+# 按群锁；并发起来能把一页的墙钟时间压掉大半，又不会把上游打疼。
+CONTAINER_DETAIL_CONC = 3
+# 一页卡片少于这个数就认为到底了（微博最后一页往往只回少量卡片）
+LIST_PAGE_MIN_CARDS = 5
 
 # Cookie 只跟微博系域名出站：指令参数里的链接与小程序卡片是不可信输入，
 # 解析与 page 兜底可能把请求带去任意外域，访客/登录 Cookie 一个字节都不能带出去。
@@ -217,11 +235,13 @@ class WeiboClient:
         cookie: str = "",
         timeout: int = 25,
         proxy: str = "",
+        bootstrap_cooldown: float = BOOTSTRAP_COOLDOWN,
     ):
         self.s = session
         self.cookie = (cookie or "").strip()
         self.timeout = timeout
         self.proxy = proxy or None
+        self.bs_cooldown = float(bootstrap_cooldown)
         self._visitor_ok = False
         self._visitor_ts = 0.0
         # 访客 Cookie 按域名分桶：.weibo.cn 与 .weibo.com 的 SUB 同名但取值不同
@@ -229,6 +249,13 @@ class WeiboClient:
         self._bootstrapping = False
         # 引导收场信号：并发 5 路同时撞 403 时，只有一路引导，其余等这一路收场再重试
         self._bootstrap_evt = asyncio.Event()
+        # 引导失败的时间与连续失败次数：失败原先不留痕迹，下一个内容请求就再原样
+        # 重跑一遍完整引导（9 个请求），必须记下来才能进冷却
+        self._bootstrap_failed_at = 0.0
+        self._bootstrap_fails = 0
+        # 真单飞：并发进来的引导只有一路真跑，其余在锁上等到它结束后复查结果。
+        # _bootstrap_evt 只解决"等收场"，被唤醒的等待者原先各自又去引导一遍
+        self._bootstrap_lock = asyncio.Lock()
 
     # ---------- 基础请求 ----------
 
@@ -275,6 +302,7 @@ class WeiboClient:
         max_bytes: int = 0,
         in_bootstrap: bool = False,
         sink: Path | None = None,
+        read_body: bool = True,
     ):
         last = None
         for attempt in range(RETRY_TIMES):
@@ -312,7 +340,26 @@ class WeiboClient:
                         for morsel in r.cookies.values():
                             if morsel.value and morsel.value != "deleted":
                                 self._ck[bucket][morsel.key] = morsel.value
-                        if sink is not None and r.status == 200:
+                        if not read_body:
+                            # 只要状态码与最终 URL 的场合（短链跟跳转）：body 一个
+                            # 字节都不读。落地页动辄几百 KB，之前为了拿跳转后的
+                            # 地址把整页读进来，纯属白付带宽和内存
+                            body = b""
+                        elif sink is not None and r.status == 200:
+                            # 要落盘的是图片/媒体，text/html 只可能是风控页或错误页。
+                            # 不拦的话 >1KB 的 HTML 会被当图片存下来，问题要推迟到
+                            # ffmpeg 转码或上传时才爆，报错离根因很远。只拒这一种，
+                            # 别搞白名单：CDN 回 application/octet-stream 是常态。
+                            # getattr 兜底：测试替身不一定有 headers
+                            ctype = str(
+                                (getattr(r, "headers", None) or {}).get(
+                                    "Content-Type", ""
+                                )
+                            ).lower()
+                            if "text/html" in ctype:
+                                raise WeiboError(
+                                    f"拿到的是 HTML 页面（多半被风控拦了），不是图片：{url}"
+                                )
                             # 指定了落盘目标且成功响应：边下边写文件，内存里只过 chunk
                             body = await self._stream_to_sink(r, sink, max_bytes)
                         elif max_bytes:
@@ -322,7 +369,8 @@ class WeiboClient:
                                 buf += chunk
                                 if len(buf) > max_bytes:
                                     raise WeiboError(
-                                        f"图片超过 {max_bytes // 1048576}MB 上限，已中止下载"
+                                        f"响应体超过 {max_bytes // 1048576}MB 上限，"
+                                        "已中止读取"
                                     )
                             body = bytes(buf)
                         else:
@@ -392,28 +440,74 @@ class WeiboClient:
         return b""
 
     async def get_json(
-        self, url: str, referer: str = "https://m.weibo.cn/", desktop: bool = False
+        self,
+        url: str,
+        referer: str = "https://m.weibo.cn/",
+        desktop: bool = False,
+        max_bytes: int = MAX_BODY_BYTES,
     ) -> dict:
-        st, _, body = await self._raw(url, referer=referer, ajax=True, desktop=desktop)
+        st, _, body = await self._raw(
+            url, referer=referer, ajax=True, desktop=desktop, max_bytes=max_bytes
+        )
         try:
             return json.loads(body.decode("utf-8", "replace"))
         except Exception:
             raise WeiboError(f"接口未返回 JSON (http {st}): {url}")
 
     async def get_text(
-        self, url: str, referer: str = "https://m.weibo.cn/", desktop: bool = False
+        self,
+        url: str,
+        referer: str = "https://m.weibo.cn/",
+        desktop: bool = False,
+        max_bytes: int = MAX_BODY_BYTES,
     ) -> tuple[str, str]:
-        st, final, body = await self._raw(url, referer=referer, desktop=desktop)
+        st, final, body = await self._raw(
+            url, referer=referer, desktop=desktop, max_bytes=max_bytes
+        )
         return body.decode("utf-8", "replace"), str(final)
 
     # ---------- 访客 Cookie ----------
 
+    def _bootstrap_cooldown(self) -> float:
+        """连续失败时的引导冷却：60s、120s、240s…封顶 10 分钟。
+
+        偶发失败（微博抽风）等 60s 就够；持续被拒（出口 IP 被限、网关变了）则
+        逐次拉开间隔，免得每一次内容请求都去试一遍那 9 个引导请求。
+        基数来自配置 bootstrap_cooldown，配 0 就退回"失败也不记"的旧行为。
+        """
+        if self.bs_cooldown <= 0:
+            return 0.0
+        return min(
+            self.bs_cooldown * (2 ** max(0, self._bootstrap_fails - 1)),
+            max(BOOTSTRAP_COOLDOWN_MAX, self.bs_cooldown),
+        )
+
     async def bootstrap_visitor(self, force: bool = False) -> bool:
-        """微博对匿名请求要求先过访客网关；同时引导 .weibo.cn 与 .weibo.com 两套 Cookie。"""
-        if not force and self._visitor_ok and time.time() - self._visitor_ts < 1800:
-            return True
+        """微博对匿名请求要求先过访客网关；同时引导 .weibo.cn 与 .weibo.com 两套 Cookie。
+
+        force=True 表示上游刚回了 403，是新证据：允许绕过"访客 Cookie 还新鲜"的
+        判断去换一套。但它**同样受失败冷却约束**——否则同一条指令里连续几十次
+        403 就等于连续重引导，冷却就形同虚设了。
+
+        并发调用是**真单飞**：只有一路真跑引导，其余在锁上等它结束后复查缓存，
+        直接复用结果，不会再各自引导一遍。
+        """
         if self.cookie and not force:
             return True
+        async with self._bootstrap_lock:
+            # 等锁期间前一路可能已经引导成功（或刚失败进冷却），复查一次再决定
+            if not force and self._visitor_ok and time.time() - self._visitor_ts < 1800:
+                return True
+            if time.time() - self._bootstrap_failed_at < self._bootstrap_cooldown():
+                return False
+            return await self._bootstrap_once()
+
+    async def _bootstrap_once(self) -> bool:
+        """真跑一次访客引导；单飞与冷却判断由 bootstrap_visitor 负责。
+
+        成功/失败都要落痕：成功刷新 _visitor_ts 并把连续失败计数清零，失败记下
+        时间并累加计数，供下一次调用判断是否还在冷却期内。
+        """
         ok = False
         self._bootstrapping = True
         try:
@@ -423,27 +517,27 @@ class WeiboClient:
                 in_bootstrap=True,
             )
             m = re.search(r'"tid":"([^"]+)"', body.decode("utf-8", "replace"))
-            if not m:
-                return False
-            tid = urllib.parse.quote(m.group(1))
-            # 走各自域名的访客网关，Cookie 才能正确落到对应桶
-            for host, ref, extra in (
-                (
-                    "visitor.passport.weibo.cn",
-                    "https://m.weibo.cn/",
-                    "&domain=.weibo.cn",
-                ),
-                ("passport.weibo.com", "https://weibo.com/", ""),
-            ):
-                u = (
-                    f"https://{host}/visitor/visitor?a=incarnate"
-                    f"&t={tid}&w=2&c=095&gc=&cb=cross_domain&from=weibo{extra}&_rand={time.time()}"
-                )
-                st2, _, _ = await self._raw(u, referer=ref, in_bootstrap=True)
-                ok = ok or st2 == 200
-            ok = bool(self._ck["cn"] or self._ck["com"])
+            if m:
+                tid = urllib.parse.quote(m.group(1))
+                # 走各自域名的访客网关，Cookie 才能正确落到对应桶
+                for host, ref, extra in (
+                    (
+                        "visitor.passport.weibo.cn",
+                        "https://m.weibo.cn/",
+                        "&domain=.weibo.cn",
+                    ),
+                    ("passport.weibo.com", "https://weibo.com/", ""),
+                ):
+                    u = (
+                        f"https://{host}/visitor/visitor?a=incarnate"
+                        f"&t={tid}&w=2&c=095&gc=&cb=cross_domain&from=weibo{extra}"
+                        f"&_rand={time.time()}"
+                    )
+                    st2, _, _ = await self._raw(u, referer=ref, in_bootstrap=True)
+                    ok = ok or st2 == 200
+                ok = bool(self._ck["cn"] or self._ck["com"])
         except WeiboError:
-            return False
+            ok = False
         finally:
             self._bootstrapping = False
             # 放行所有等引导收场的并发请求：set 唤醒现有等待者，clear 只影响后来的
@@ -452,6 +546,10 @@ class WeiboClient:
         if ok:
             self._visitor_ok = True
             self._visitor_ts = time.time()
+            self._bootstrap_fails = 0
+        else:
+            self._bootstrap_failed_at = time.time()
+            self._bootstrap_fails += 1
         return ok
 
     # ---------- 链接解析 ----------
@@ -477,7 +575,10 @@ class WeiboClient:
             r"weibo\.com/[^/\s]+/R[\w]{7,}$", final_url, re.I
         ):
             try:
-                _, jumped, _ = await self._raw(final_url, allow_redirects=True)
+                # 只借这一跳拿跳转后的地址，落地页多大多复杂都与这里无关
+                _, jumped, _ = await self._raw(
+                    final_url, allow_redirects=True, read_body=False
+                )
                 if jumped:
                     final_url = str(jumped)
             except WeiboError:
@@ -800,6 +901,11 @@ class WeiboClient:
     def _imgs_from_html(self, html: str) -> list[Image]:
         """通用兜底：从任意页面 HTML 里收集正文图片（覆盖小程序 H5、图集页等）。"""
         html = html or ""
+        # 廉价预筛：页面里连 sinaimg 字样都没有，后面那两个贪婪正则一定搜不出东西，
+        # 却要对整页（可能几 MB）扫一遍。文章页/兜底页每次都走这里，先花一次
+        # 子串查找把纯文本页、错误页挡掉
+        if "sinaimg" not in html:
+            return []
         body = re.search(
             r'(class="W_iter"[\s\S]*|class="ab_content"[\s\S]*|id="sina_editor_sp2_body"[\s\S]*)',
             html,
@@ -850,11 +956,24 @@ class WeiboClient:
             source="card",
         )
 
-    async def fetch_container(self, containerid: str, max_pages: int = 3) -> list[Post]:
+    async def fetch_container(
+        self,
+        containerid: str,
+        max_pages: int = 3,
+        detail_conc: int = CONTAINER_DETAIL_CONC,
+    ) -> list[Post]:
         await self.bootstrap_visitor()
         posts: list[Post] = []
         seen: set[str] = set()
         ref = "https://m.weibo.cn/"
+        sem = asyncio.Semaphore(max(1, detail_conc))
+
+        async def one(idx: int, mid: str, mb: dict, need_detail: bool):
+            if not need_detail:
+                return idx, self._post_from_card(mb)
+            async with sem:
+                return idx, await self.fetch_status(mid)
+
         for page in range(1, max_pages + 1):
             url = (
                 "https://m.weibo.cn/api/container/getIndex"
@@ -868,6 +987,7 @@ class WeiboClient:
                 break
             cards = (j.get("data") or {}).get("cards") or []
             fresh = 0
+            items: list[tuple[int, str, dict, bool]] = []
             for c in cards:
                 if not isinstance(c, dict):
                     continue
@@ -880,15 +1000,25 @@ class WeiboClient:
                     fresh += 1
                     # 列表卡片只给前 9 张，长微博正文也在另一个接口；只有这些
                     # "可能被截断"的才补一次详情请求，否则整页会退化成 N+1。
-                    if (
-                        len(pics) >= 9
+                    need_detail = bool(
+                        len(pics) >= LIST_CARD_MAX_PICS
                         or mb.get("isLongText")
                         or mb.get("retweeted_status")
-                    ):
-                        posts.append(await self.fetch_status(mid))
-                    else:
-                        posts.append(self._post_from_card(mb))
-            if not fresh or len(cards) < 5:
+                    )
+                    items.append((len(items), mid, mb, need_detail))
+            # 补详情并发跑（原先是循环里逐条 await，一页能串十几轮），但要保序：
+            # 按序号回填，漏了详情的卡片位置不能乱
+            results = await asyncio.gather(
+                *(one(*it) for it in items), return_exceptions=True
+            )
+            index: dict[int, Post] = {}
+            for r in results:
+                if isinstance(r, BaseException):
+                    # 与改动前一致：详情拿不到就整体失败，不静默少几张图
+                    raise r
+                index[r[0]] = r[1]
+            posts.extend(index[i] for i in range(len(items)))
+            if not fresh or len(cards) < LIST_PAGE_MIN_CARDS:
                 break
             await asyncio.sleep(0.7)
         return posts
@@ -911,7 +1041,12 @@ class WeiboClient:
 
     # ---------- 汇总入口 ----------
 
-    async def grab(self, text: str, max_pages: int = 3) -> list[Post]:
+    async def grab(
+        self,
+        text: str,
+        max_pages: int = 3,
+        detail_conc: int = CONTAINER_DETAIL_CONC,
+    ) -> list[Post]:
         target = await self.resolve_target(text)
         kind, tid = target["kind"], target["id"]
         if kind == "status":
@@ -919,5 +1054,7 @@ class WeiboClient:
         if kind == "article":
             return [await self.fetch_article(tid)]
         if kind in ("feed", "album"):
-            return await self.fetch_container(tid, max_pages=max_pages)
+            return await self.fetch_container(
+                tid, max_pages=max_pages, detail_conc=detail_conc
+            )
         return [await self.fetch_page(target["url"] or text)]
