@@ -3,8 +3,8 @@ display_name: 微博/小红书原图传群相册
 desc: 抓取微博或小红书链接/分享卡片里的全部图片（平台自动识别，无需区分命令；微博原图与 live 图转 GIF、小红书笔记图集无水印优先），并通过 NapCat 上传到 QQ 群相册的指定相册。
 short_desc: 微博/小红书图片一键搬进群相册
 version: v1.9.4
-author: wbalbum
-repo: https://github.com/wbalbum/astrbot_plugin_weibo_album
+author: diyushuang
+repo: https://github.com/diyushuang/astrbot_plugin_weibo_album
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.24,<5"

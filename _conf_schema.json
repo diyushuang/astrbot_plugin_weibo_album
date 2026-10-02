@@ -109,6 +109,8 @@
     "description": "代理地址",
     "type": "string",
     "default": "",
-    "hint": "形如 http://127.0.0.1:7890，留空表示不用"
+    "secret": true,
+    "hint": "形如 http://127.0.0.1:7890，留空表示不用。带账号密码的代理写成 http://用户名:密码@主机:端口；因为可能内嵌凭据，这一项在配置面板里按密码框显示",
+    "obvious_hint": true
   }
 }

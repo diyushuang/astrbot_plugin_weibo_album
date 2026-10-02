@@ -33,6 +33,13 @@
 - **`main.py` 取 `self_id` 补 `getattr` 兜底**，与贴表情处的写法对齐
 - **构造函数对 `config` 缺失容错**：`__init__` 原先把 `config` 写成必填参数。AstrBot 的加载器有三条构造路径，其中两条（`core/star/star_manager.py` 的"读不到插件配置"与"带 config 构造抛 TypeError 后的回退"）**只传 `context`**，走那两条会直接 `TypeError` 导致整个插件加载失败。现改为 `config: dict | None = None` + `config or {}`，用真实 astrbot 4.28.2 实测三条路径均可实例化（此前只有第一条能过）
 
+**安全与合规**
+
+- **`metadata.yaml` 的 `repo` 原先指向不存在的仓库**：写的是 `wbalbum/astrbot_plugin_weibo_album`，实测返回 404；实际仓库是 `diyushuang/astrbot_plugin_weibo_album`。插件市场用这个字段链接源码，指错就等于用户点过去是死链。已改为实际仓库，`author` 同步改正
+- **测试夹具里残留的真实小红书分享 token**：`tests/test_xhs_client.py` 有 3 处 `xsec_token` 用的是真实分享链接里带出来的取值（写测试时直接粘过来的，取值不再在此复述）。该 token 对这组用例没有任何断言作用——同文件其它用例本来就用 `TOK`/`ABC`/`T` 占位——已统一换成 `TOK`
+- **`proxy` 配置项补 `secret` 脱敏**：带账号密码的代理写成 `http://用户名:密码@主机:端口` 是常态，此前会在 WebUI 配置面板明文显示。现与两个 Cookie 项一样按密码框展示
+- 附带结论（本轮做了全仓密钥扫描，含 git 全历史）：源码、配置 schema、发布包与提交历史里**没有硬编码的凭据**——测试里的 `SUB=secret-login` / `web_session=SECRET` 都是占位符；`.gitignore` 已覆盖 `.env` / `.env.*` / `*.session`；git remote 未内嵌凭据
+
 **文档与测试**
 
 - README 版本徽章与发布 zip 名从 v1.8.0 对齐到本版（此前滞后多个版本）；配置表补齐本轮新增的五项
