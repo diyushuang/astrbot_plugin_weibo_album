@@ -29,13 +29,21 @@ from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DIR_NAME = "astrbot_plugin_weibo_album"
-WEIBO_LINK = "https://m.weibo.cn/detail/4990000000000000"  # 单条 18 图
-# 混合媒体微博：多图 + live 图 + 结尾视频（用户真实遇到的帖子）
-WEIBO_MIXED_LINK = "https://weibo.com/1234567890/4991111111111111"
+
+# 真连网络的测试样本一律从环境变量读，仓库里不留任何具体微博内容。
+# 这几条用例的价值就在于走真实网络，但样本本身不该长在仓库里（它是别人的帖子，
+# 会过期、也牵扯不到本项目）。没设置时脚本打印提示后跳过，离线用例不受影响。
+#   WEIBO_ALBUM_TEST_LINK        单条多图微博（移动端 / 网页版直链均可）
+#   WEIBO_ALBUM_TEST_BID         同一条微博的短链 bid（「裸 ID」与「小程序卡片」两条路径要用）
+#   WEIBO_ALBUM_TEST_MIXED_LINK  含 live 图与视频条目的混合媒体微博
+#   WEIBO_ALBUM_TEST_PICS        WEIBO_ALBUM_TEST_LINK 的图片张数，默认 18
+WEIBO_LINK = os.environ.get("WEIBO_ALBUM_TEST_LINK", "").strip()
+WEIBO_BID = os.environ.get("WEIBO_ALBUM_TEST_BID", "").strip()
+WEIBO_MIXED_LINK = os.environ.get("WEIBO_ALBUM_TEST_MIXED_LINK", "").strip()
+N_PICS = int(os.environ.get("WEIBO_ALBUM_TEST_PICS", "18") or 18)
 WEIBO_MINI_TEXT = (
-    "【微博】一起来看 https://m.weibo.cn/status/Ab1Cd2Ef3 打开微博小程序查看"
+    f"【微博】一起来看 https://m.weibo.cn/status/{WEIBO_BID} 打开微博小程序查看"
 )
-N_PICS = 18
 
 # QQ 里分享微博生成的小程序卡片：本体是消息里的 json 段，字段没有公开文档，
 # 这里按真实卡片的结构给一份（icon 是图床链接、url 是微博页、qqdocurl 是中转）
@@ -48,9 +56,9 @@ WEIBO_CARD_JSON = json.dumps(
                 "appid": 100951776,
                 "desc": "一起来看",
                 "icon": "https://wx2.sinaimg.cn/crop.0.0.120.120.120/abc.jpg",
-                "qqdocurl": "https://workflow.op.weibo.com/?uv=Ab1Cd2Ef3",
-                "title": "#小程序://微博/Ab1Cd2Ef3",
-                "url": "https://m.weibo.cn/status/Ab1Cd2Ef3",
+                "qqdocurl": f"https://workflow.op.weibo.com/?uv={WEIBO_BID}",
+                "title": f"#小程序://微博/{WEIBO_BID}",
+                "url": f"https://m.weibo.cn/status/{WEIBO_BID}",
             }
         },
         "prompt": "[小程序]微博",
@@ -642,6 +650,30 @@ def reset_store(store):
 async def main():
     global EVENT_BOT, EVENT_PLUGIN
 
+    # 这几条用例真连微博网络，样本由环境变量提供；没给就明确跳过，
+    # 而不是拿一个写死的（且会过期、还是别人帖子的）链接去跑
+    missing = [
+        name
+        for name, val in (
+            ("WEIBO_ALBUM_TEST_LINK", WEIBO_LINK),
+            ("WEIBO_ALBUM_TEST_BID", WEIBO_BID),
+            ("WEIBO_ALBUM_TEST_MIXED_LINK", WEIBO_MIXED_LINK),
+        )
+        if not val
+    ]
+    if missing:
+        print(
+            "跳过 e2e：需要真实微博样本，仓库里不留具体链接，请先设好环境变量：\n"
+            "  WEIBO_ALBUM_TEST_LINK        单条多图微博（移动端 / 网页版直链均可）\n"
+            "  WEIBO_ALBUM_TEST_BID         同一条微博的短链 bid\n"
+            "  WEIBO_ALBUM_TEST_MIXED_LINK  含 live 图与视频条目的混合媒体微博\n"
+            "  WEIBO_ALBUM_TEST_PICS        LINK 的图片张数，默认 18（可省）\n"
+            f"当前缺少：{', '.join(missing)}\n"
+            "离线用例（test_weibo_client / test_xhs_client / mock_napcat_test）不需要这些，"
+            "可直接跑。"
+        )
+        return
+
     flt, Star, _, registered = install_fake_astrbot()
     store = {"uploads": [], "media": [], "calls": [], "reject_path": 0}
 
@@ -915,8 +947,8 @@ async def main():
 
         # ---- 用例 5：只发裸 ID 也能认；没链接也没 ID 时给出可操作提示
         reset_store(store)
-        ev5 = make_event("Ab1Cd2Ef3")
-        await rt.dispatch("传图 Ab1Cd2Ef3 | 微博原图", ev5)
+        ev5 = make_event(WEIBO_BID)
+        await rt.dispatch(f"传图 {WEIBO_BID} | 微博原图", ev5)
         assert len(store["uploads"]) == N_PICS, (len(store["uploads"]), ev5.sent)
         print("[ok] 用例5a 裸微博 ID 直接可用")
 

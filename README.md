@@ -261,12 +261,27 @@ QQ 卡片结构没有公开文档，不押注某个固定字段名；`workflow.o
 python tests/mock_napcat_test.py     # NapCat 客户端契约：翻页解析、载荷降级与"学一次就记住"、错误分类
 python tests/test_weibo_client.py    # 离线单测（无网）：链接解析、pid 提取、引用卡片解析、引导退避
 python tests/test_xhs_client.py      # 离线单测（无网）：小红书链接/短链解析、图集提取、无水印优先与回落
-python tests/test_plugin_e2e.py      # 端到端（真实网络）：29 个用例走完指令链路 + 假 NapCat 上传
+python tests/test_plugin_e2e.py      # 端到端（真实网络）：41 项用例走完指令链路 + 假 NapCat 上传
 ```
+
+前三个不需要网络，直接跑。`test_plugin_e2e.py` 要连真实微博，**样本从环境变量读**——
+仓库里不留具体微博链接（那是别人的帖子，会过期，也不该长在代码库里）。不给变量时它会
+打印提示并跳过，不影响其它用例：
+
+```bash
+export WEIBO_ALBUM_TEST_LINK="https://m.weibo.cn/detail/<单条多图微博的 id>"
+export WEIBO_ALBUM_TEST_BID="<同一条微博的短链 bid>"                # 「裸 ID」「小程序卡片」两条路径要用
+export WEIBO_ALBUM_TEST_MIXED_LINK="https://weibo.com/<uid>/<bid>"  # 含 live 图与视频条目的混合微博
+export WEIBO_ALBUM_TEST_PICS=18                                     # LINK 的图片张数，默认 18
+python tests/test_plugin_e2e.py
+```
+
+同一条微博的数字 id 与短链 bid 可以互推（`m.weibo.cn/status/<bid>` 打开后地址栏里就是数字 id），
+所以 `LINK` 和 `BID` 指同一条帖子即可。
 
 `test_plugin_e2e.py` 按 AstrBot 的真实加载方式导入插件，用一份照抄上游算法的 `CommandFilter`
 复刻做指令匹配与参数绑定，伪造的 astrbot 面刻意"只严不松"（替身比真 API 宽松是历史上几个
-阻断性 bug 全绿通过的原因）。覆盖：18 图整批链路、小红书笔记整链路（指令路由/上传/去重/跨指令
+阻断性 bug 全绿通过的原因）。覆盖：多图整批链路、小红书笔记整链路（指令路由/上传/去重/跨指令
 改道）、去重、两种 `skip_exists` 下的重传闭环、引用卡片/纯文本/异常路径、批次记住目标相册、
 TTL 清扫、并发锁、载荷探测学习、出厂默认零 ENOENT、`terminate` 撤任务等。同一次运行内会缓存抓取结果
 （首个仍是真实网络），避免 160+ 次请求。
