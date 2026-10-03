@@ -6,6 +6,7 @@
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -140,6 +141,43 @@ def split_album(text: str) -> tuple[str, str]:
     return text, ""
 
 
+class _DeadSocketWriteFilter(logging.Filter):
+    """从源头屏蔽 asyncio 对"对端已关闭的连接"的重复写告警。
+
+    传图开始时刷屏的 `socket.send() raised exception.` 来自 asyncio 传输层：与
+    NapCat（或 WebUI 页签）之间的 TCP 连接被对端关掉后，AstrBot 侧还在飞的写入
+    头 4 次静默丢弃，从第 5 次起每次写入各刷一条 WARN
+    （LOG_THRESHOLD_FOR_CONNLOST_WRITES，selector_events / proactor_events 两处
+    实现同款），大批量上传的瞬间就是几毫秒内连发的一串。这条消息不带异常详情、
+    定位不到是哪条连接，也不改变任何调用的结果；断连真正的失败信号是插件逐张
+    的"上传失败 …"日志（传输层断连已归为可重试错误，走退避），这里只负责止血。
+
+    挂在记录源头（asyncio.selector_events / asyncio.proactor_events 这两个模块
+    logger）而不是根 handler：源头过滤对运行期间新挂的 handler（如 WebUI 日志
+    流）同样生效，不受 AstrBot handler 拓扑影响。
+    """
+
+    _SITES = frozenset({"asyncio.selector_events", "asyncio.proactor_events"})
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # 精确到这条原文：asyncio 的其余告警（slow callback 等）一概照常放行
+        return not (
+            record.name in self._SITES
+            and record.getMessage() == "socket.send() raised exception."
+        )
+
+
+def _silence_dead_socket_warnings() -> None:
+    """把死连接写告警静音挂到源头（幂等：热重载后重复调用不会叠加）。"""
+    installed = _DeadSocketWriteFilter()
+    for name in _DeadSocketWriteFilter._SITES:
+        logger = logging.getLogger(name)
+        # 按类名而不是 isinstance 判重：插件热重载会重新 import 本模块，
+        # 新旧类对象不相等，isinstance 挡不住跨代叠加
+        if not any(type(f).__name__ == "_DeadSocketWriteFilter" for f in logger.filters):
+            logger.addFilter(installed)
+
+
 class WeiboAlbumPlugin(Star):
     """把微博 / 小红书笔记里的原图整套搬进 QQ 群相册：先整批抓到本地，再传到选定的相册。"""
 
@@ -204,6 +242,7 @@ class WeiboAlbumPlugin(Star):
         return bool(self.config.get("same_host", False))
 
     async def initialize(self):
+        _silence_dead_socket_warnings()
         self.root.mkdir(parents=True, exist_ok=True)
         # 清残留可能要删上一次没传完的整批图（最多 30 张 × 30MB），同步删会把
         # 事件循环钉住数秒——启动/热重载期间整个 AstrBot 都不响应，丢线程池里删
